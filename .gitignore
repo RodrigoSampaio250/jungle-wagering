@@ -7,3 +7,4 @@ coverage/
 *.log
 .DS_Store
 Thumbs.db
+src/infrastructure/database/migrations/.snapshot-wagering_test_*.json
