@@ -1,7 +1,7 @@
 import { Money } from "../../domain/money";
 import { Wallet } from "../../domain/wallet";
 import type { WalletLedgerEntry } from "../../domain/wallet-ledger-entry";
-import type { WagerTransaction } from "../../domain/wager-transaction";
+import { WagerTransaction } from "../../domain/wager-transaction";
 import type { WalletRecord } from "./wallet.record";
 import type { WalletLedgerEntryRecord } from "./wallet-ledger-entry.record";
 import type { WagerTransactionRecord } from "./wager-transaction.record";
@@ -67,3 +67,47 @@ export function ledgerEntryToRecord(
     createdAt: entry.createdAt,
   };
 }
+  export function transactionFromRecord(
+      record: WagerTransactionRecord,
+    ): WagerTransaction {
+      return WagerTransaction.rehydrate({
+        id: record.id,
+        providerId: record.providerId,
+        externalTransactionId: record.externalTransactionId,
+        idempotencyKey: record.idempotencyKey,
+        payloadHash: record.payloadHash,
+        walletId: record.walletId,
+        playerId: record.playerId,
+        roundId: record.roundId,
+        gameId: record.gameId,
+        kind: record.kind,
+        money: Money.from({
+          amount: record.amount,
+          currency: record.currency,
+        }),
+        status: record.status,
+        createdAt: record.createdAt,
+        ...(record.referenceExternalTransactionId !== null
+          ? {
+              referenceExternalTransactionId:
+                record.referenceExternalTransactionId,
+            }
+          : {}),
+        ...(record.referenceTransactionId !== null
+          ? {
+              referenceTransactionId:
+                record.referenceTransactionId,
+            }
+          : {}),
+        ...(record.failureCode !== null
+          ? {
+              failureCode: record.failureCode,
+            }
+          : {}),
+        ...(record.processedAt !== null
+          ? {
+              processedAt: record.processedAt,
+            }
+          : {}),
+      });
+    }

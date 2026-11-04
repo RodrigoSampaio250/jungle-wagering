@@ -26,6 +26,7 @@ import { WalletLedgerEntryRecord } from "./wallet-ledger-entry.record";
 import { WagerTransactionRecord } from "./wager-transaction.record";
 import {
   ledgerEntryToRecord,
+  transactionFromRecord,
   transactionToRecord,
   walletFromRecord,
 } from "./wager-mappers";
@@ -49,7 +50,7 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
       }
 
       // A tentativa de inserção já foi revertida.
-      // No consumidor, a consulta permanece na transação da inbox.
+      // No consumidor, permanecemos na transação da inbox.
       const em = this.transactionManager ?? this.orm.em.fork();
 
       const existing = await em.findOne(WagerTransactionRecord, {
@@ -77,18 +78,45 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
     }
   }
 
+  async retryPendingReference(
+    record: WagerTransactionRecord,
+  ): Promise<WagerProcessingResult> {
+    if (
+      !this.transactionManager ||
+      !this.transactionManager.isInTransaction()
+    ) {
+      throw new Error(
+        "A retomada exige uma transação ativa e o registro bloqueado.",
+      );
+    }
+
+    if (record.status !== Status.PendingReference) {
+      throw new Error(
+        "Somente transações PENDING_REFERENCE podem ser retomadas.",
+      );
+    }
+
+    return this.processNew(
+      transactionFromRecord(record),
+      record,
+    );
+  }
+
   private async processNew(
     transaction: WagerTransaction,
+    existingRecord?: WagerTransactionRecord,
   ): Promise<WagerProcessingResult> {
     const manager = this.transactionManager ?? this.orm.em.fork();
 
     return manager.transactional(async (em) => {
-      // Reserva a identidade antes de bloquear a carteira.
-      // As restrições UNIQUE arbitram requisições concorrentes.
-      await em.insert(
-        WagerTransactionRecord,
-        transactionToRecord(transaction),
-      );
+      // Na primeira execução, reserva a identidade.
+      // Na retomada, o worker já bloqueou o registro existente.
+      if (!existingRecord) {
+        await em.insert(
+          WagerTransactionRecord,
+          transactionToRecord(transaction),
+        );
+      }
 
       let resultBalance: string | null = null;
 
@@ -122,7 +150,11 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
               transaction.referenceExternalTransactionId,
           });
 
-          if (!reference) {
+          if (
+            !reference ||
+            reference.status === Status.Pending ||
+            reference.status === Status.PendingReference
+          ) {
             transaction.markPendingReference();
           } else {
             const failure = this.referenceFailure(
@@ -154,7 +186,13 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
           }
         }
 
-        if (transaction.status === Status.Pending) {
+        if (
+          transaction.status === Status.Pending ||
+          (
+            transaction.status === Status.PendingReference &&
+            reference?.status === Status.Processed
+          )
+        ) {
           const at = new Date();
 
           if (transaction.kind === Kind.Loss) {
@@ -221,12 +259,22 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
         resultBalance,
       );
 
+      record.referenceAttempts = existingRecord
+        ? existingRecord.referenceAttempts + 1
+        : 0;
+
       if (transaction.status === Status.PendingReference) {
-        record.nextReferenceAttemptAt = new Date(Date.now() + 1_000);
+        const delayMs = Math.min(
+          60_000,
+          1_000 * 2 ** Math.min(record.referenceAttempts, 6),
+        );
+
+        record.nextReferenceAttemptAt = new Date(
+          Date.now() + delayMs,
+        );
       }
 
-      // O registro ainda está PENDING no banco.
-      // Esta é sua única atualização para o resultado final.
+      // Persiste o resultado e o agendamento na mesma transação.
       await em.nativeUpdate(
         WagerTransactionRecord,
         { id: transaction.id },
@@ -235,30 +283,19 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
           referenceTransactionId: record.referenceTransactionId,
           failureCode: record.failureCode,
           resultBalance: record.resultBalance,
+          referenceAttempts: record.referenceAttempts,
           nextReferenceAttemptAt: record.nextReferenceAttemptAt,
           processedAt: record.processedAt,
         },
       );
 
-        const event = transactionOutboxEvent(record);
+      const event = transactionOutboxEvent(record);
 
-        if (event) {
-          await em.insert(OutboxEventRecord, event);
-        }
+      if (event) {
+        await em.insert(OutboxEventRecord, event);
+      }
 
-      return {
-        transactionId: record.id,
-        status: record.status,
-        balance:
-          resultBalance === null
-            ? null
-            : {
-                amount: resultBalance,
-                currency: transaction.money.currency,
-              },
-        failureCode: record.failureCode,
-        idempotentReplay: false,
-      };
+      return this.resultFromRecord(record, false);
     });
   }
 
