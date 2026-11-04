@@ -11,6 +11,7 @@ import {
   NotFoundException,
   Param,
   ParseUUIDPipe,
+  Query,
 } from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/postgresql";
 import { SubmitWager } from "../../application/submit-wager";
@@ -36,6 +37,44 @@ export class WagerController {
       new MikroOrmWagerProcessor(orm),
     );
   }
+
+    @Get("lookup/external")
+        async findByExternalId(
+            @Query("providerId") providerId: unknown,
+            @Query("externalTransactionId") externalTransactionId: unknown,
+        ) {
+            if (
+            typeof providerId !== "string" ||
+            !providerId.trim() ||
+            providerId.length > 100 ||
+            typeof externalTransactionId !== "string" ||
+            !externalTransactionId.trim() ||
+            externalTransactionId.length > 200
+            ) {
+            throw new BadRequestException({
+                code: "INVALID_TRANSACTION_LOOKUP",
+                message:
+                "Informe providerId e externalTransactionId válidos.",
+            });
+            }
+
+            const transaction = await this.orm.em.fork().findOne(
+            WagerTransactionRecord,
+            {
+                providerId,
+                externalTransactionId,
+            },
+            );
+
+            if (!transaction) {
+            throw new NotFoundException({
+                code: "TRANSACTION_NOT_FOUND",
+                message: "Transação não encontrada.",
+            });
+            }
+
+            return this.findById(transaction.id);
+        }
 
      @Get(":id")
   async findById(

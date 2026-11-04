@@ -1,23 +1,12 @@
 import "reflect-metadata";
-import { ValidationPipe } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
+import { configureHttp } from "./infrastructure/http/configure-http";
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule);
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      transform: true,
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      forbidUnknownValues: true,
-      transformOptions: {
-        enableImplicitConversion: false,
-      },
-    }),
-  );
-
+  configureHttp(app);
   app.enableShutdownHooks();
 
   await app.listen(3000, "0.0.0.0");
