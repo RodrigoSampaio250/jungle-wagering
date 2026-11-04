@@ -16,5 +16,29 @@ services:
       retries: 10
     restart: unless-stopped
 
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT_STRATEGY: dynamic
+    ports:
+      - "127.0.0.1:4566:4566"
+    healthcheck:
+      test:
+        - CMD
+        - awslocal
+        - sqs
+        - list-queues
+        - --region
+        - us-east-1
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
 volumes:
   postgres_data:

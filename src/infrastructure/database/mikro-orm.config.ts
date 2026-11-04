@@ -4,6 +4,7 @@ import { WalletRecordSchema } from "./wallet.record";
 import { WagerTransactionRecordSchema } from "./wager-transaction.record";
 import { WalletLedgerEntryRecordSchema } from "./wallet-ledger-entry.record";
 import { OutboxEventRecordSchema } from "./outbox-event.record";
+import { InboxMessageRecordSchema } from "./inbox-message.record";
 
 export default defineConfig({
   entities: [
@@ -11,6 +12,7 @@ export default defineConfig({
     WagerTransactionRecordSchema,
     WalletLedgerEntryRecordSchema,
     OutboxEventRecordSchema,
+    InboxMessageRecordSchema,
   ],
   clientUrl:
     process.env.DATABASE_URL ??

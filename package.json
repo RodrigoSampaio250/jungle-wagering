@@ -10,6 +10,7 @@
     "db": "bun ./node_modules/@mikro-orm/cli/cli.js"
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "3.1161.0",
     "@mikro-orm/core": "6.6.17",
     "@mikro-orm/migrations": "6.6.17",
     "@mikro-orm/postgresql": "6.6.17",

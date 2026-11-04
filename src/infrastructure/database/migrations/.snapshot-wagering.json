@@ -22,6 +22,119 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "consumer_name": {
+          "name": "consumer_name",
+          "type": "varchar(100)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": 100,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "varchar(200)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 200,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "payload_hash": {
+          "name": "payload_hash",
+          "type": "varchar(64)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 64,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "processed_at": {
+          "name": "processed_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "inbox_messages",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "consumer_name",
+            "message_id"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "inbox_consumer_message_unique",
+          "unique": true,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "inbox_messages_pkey",
+          "unique": true,
+          "primary": true
+        }
+      ],
+      "checks": [],
+      "foreignKeys": {},
+      "nativeEnums": {},
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
         "aggregate_id": {
           "name": "aggregate_id",
           "type": "uuid",
@@ -876,13 +989,13 @@
         },
         {
           "name": "ledger_arithmetic_valid",
-          "columnName": "direction",
+          "columnName": "balance_after",
           "definition": "CHECK (((((direction)::text = 'DEBIT'::text) AND (balance_after = (balance_before - amount))) OR (((direction)::text = 'CREDIT'::text) AND (balance_after = (balance_before + amount)))))",
           "expression": "((direction = 'DEBIT'::text) AND balance_after = (balance_before - amount))) OR (((direction = 'CREDIT'::text) AND (balance_after = (balance_before + amount)))"
         },
         {
           "name": "ledger_balances_nonnegative",
-          "columnName": "balance_after",
+          "columnName": "balance_before",
           "definition": "CHECK (((balance_before >= (0)::numeric) AND (balance_after >= (0)::numeric)))",
           "expression": "balance_before >= (0) AND balance_after >= (0)"
         }
