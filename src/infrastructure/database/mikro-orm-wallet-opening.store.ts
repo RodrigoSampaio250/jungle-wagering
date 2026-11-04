@@ -8,6 +8,9 @@ import {
 import { WalletRecord } from "./wallet.record";
 import { WagerTransactionRecord } from "./wager-transaction.record";
 import { WalletLedgerEntryRecord } from "./wallet-ledger-entry.record";
+import { OutboxEventRecord } from "./outbox-event.record";
+import { transactionOutboxEvent } from "./transaction-outbox-event";
+import { transactionToRecord } from "./wager-mappers";
 
 export class MikroOrmWalletOpeningStore
   implements WalletOpeningStore {
@@ -76,6 +79,17 @@ export class MikroOrmWalletOpeningStore
           balanceAfter: entry.balanceAfter.toString(),
           createdAt: entry.createdAt,
         });
+
+        const event = transactionOutboxEvent(
+          transactionToRecord(
+            transaction,
+            wallet.balance.toString(),
+          ),
+        );
+
+        if (event) {
+          await em.insert(OutboxEventRecord, event);
+        }
       });
     } catch (error: unknown) {
       if (

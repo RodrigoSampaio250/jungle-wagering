@@ -23,6 +23,7 @@ import {
 import config from "../../src/infrastructure/database/mikro-orm.config";
 import { MikroOrmWalletOpeningStore } from "../../src/infrastructure/database/mikro-orm-wallet-opening.store";
 import { MikroOrmWagerProcessor } from "../../src/infrastructure/database/mikro-orm-wager-processor";
+import { OutboxEventRecord } from "../../src/infrastructure/database/outbox-event.record";
 
 const databaseName =
   `wagering_test_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -693,6 +694,132 @@ describe("ProcessWager — PostgreSQL real", () => {
     expect(current.version).toBe(1);
     expect(current.balance).toBe("100.00");
     expect(current.ledger_balance).toBe("100.00");
+  });
+    test("aposta e replay geram apenas um evento na outbox", async () => {
+    const wallet = await openWallet();
+    const input = bet(wallet);
+
+    const result = await submit().execute(input);
+    await submit().execute(input);
+
+    const events = await database().em.fork().find(
+      OutboxEventRecord,
+      { aggregateId: result.transactionId },
+    );
+
+    expect(events).toHaveLength(1);
+
+    const event = events[0];
+
+    if (!event) {
+      throw new Error("Evento não encontrado.");
+    }
+
+    expect(event.eventType).toBe("transaction.processed");
+    expect(event.publishedAt).toBeNull();
+    expect(event.attempts).toBe(0);
+    expect(event.payload).toMatchObject({
+      eventId: event.id,
+      transactionId: result.transactionId,
+      walletId: wallet.id,
+      status: "PROCESSED",
+      money: {
+        amount: "25.00",
+        currency: "BRL",
+      },
+      balance: {
+        amount: "75.00",
+        currency: "BRL",
+      },
+    });
+  });
+
+  test("falha na outbox desfaz saldo ledger e transação", async () => {
+    const wallet = await openWallet();
+    const input = bet(wallet);
+    const em = database().em.fork();
+
+    // A abertura já terminou. A falha afetará apenas eventos
+    // desta carteira inseridos durante o teste.
+    await em.execute(`
+      CREATE FUNCTION simulate_outbox_failure()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        RAISE EXCEPTION 'simulated_outbox_failure';
+      END;
+      $$;
+    `);
+
+    try {
+      await em.execute(`
+        CREATE TRIGGER simulate_outbox_failure_trigger
+        BEFORE INSERT ON outbox_events
+        FOR EACH ROW
+        WHEN (
+          NEW.payload->>'walletId' = '${wallet.id}'
+        )
+        EXECUTE FUNCTION simulate_outbox_failure();
+      `);
+
+      try {
+        await expect(
+          submit().execute(input),
+        ).rejects.toThrow("simulated_outbox_failure");
+
+        expect(await state(wallet.id)).toEqual({
+          balance: "100.00",
+          version: 1,
+          entries: "1",
+          wagers: "0",
+          ledger_balance: "100.00",
+        });
+
+        // Resta somente o evento da abertura da carteira.
+        expect(
+          await em.count(OutboxEventRecord, {}),
+        ).toBeGreaterThanOrEqual(1);
+
+        const rows = await em.execute<{ total: string }[]>(
+          `SELECT count(*) AS total
+           FROM outbox_events
+           WHERE payload->>'walletId' = ?`,
+          [wallet.id],
+        );
+
+        expect(rows[0]?.total).toBe("1");
+      } finally {
+        await em.execute(`
+          DROP TRIGGER IF EXISTS simulate_outbox_failure_trigger
+          ON outbox_events;
+        `);
+      }
+    } finally {
+      await em.execute(`
+        DROP FUNCTION IF EXISTS simulate_outbox_failure();
+      `);
+    }
+
+    const retry = await submit().execute(input);
+
+    expect(retry.status).toBe(Status.Processed);
+    expect(retry.idempotentReplay).toBe(false);
+    expect(retry.balance?.amount).toBe("75.00");
+
+    expect(
+      await em.count(OutboxEventRecord, {
+        aggregateId: retry.transactionId,
+      }),
+    ).toBe(1);
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "75.00",
+      version: 2,
+      entries: "2",
+      wagers: "1",
+      ledger_balance: "75.00",
+    });
   });
 });
 

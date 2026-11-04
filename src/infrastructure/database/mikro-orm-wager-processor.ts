@@ -26,6 +26,8 @@ import {
   transactionToRecord,
   walletFromRecord,
 } from "./wager-mappers";
+import { OutboxEventRecord } from "./outbox-event.record";
+import { transactionOutboxEvent } from "./transaction-outbox-event";
 
 export class MikroOrmWagerProcessor implements WagerProcessor {
   constructor(private readonly orm: MikroORM) {}
@@ -229,6 +231,12 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
           processedAt: record.processedAt,
         },
       );
+
+        const event = transactionOutboxEvent(record);
+
+        if (event) {
+          await em.insert(OutboxEventRecord, event);
+        }
 
       return {
         transactionId: record.id,
