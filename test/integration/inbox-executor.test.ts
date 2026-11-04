@@ -1,3 +1,18 @@
+import { CreateWallet } from "../../src/application/create-wallet";
+import {
+  SubmitWager,
+  type SubmitWagerInput,
+} from "../../src/application/submit-wager";
+import {
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from "../../src/domain/wager-transaction.types";
+import { MikroOrmWalletOpeningStore } from "../../src/infrastructure/database/mikro-orm-wallet-opening.store";
+import { MikroOrmWagerProcessor } from "../../src/infrastructure/database/mikro-orm-wager-processor";
+import { WalletRecord } from "../../src/infrastructure/database/wallet.record";
+import { WalletLedgerEntryRecord } from "../../src/infrastructure/database/wallet-ledger-entry.record";
+import { WagerTransactionRecord } from "../../src/infrastructure/database/wager-transaction.record";
+import { OutboxEventRecord } from "../../src/infrastructure/database/outbox-event.record";
 import {
   afterAll,
   beforeAll,
@@ -214,3 +229,220 @@ describe("InboxExecutor — PostgreSQL real", () => {
         expect(calls).toBe(2);
     });
     });
+
+    async function financialFixture(): Promise<SubmitWagerInput> {
+  const playerId = crypto.randomUUID();
+
+  const wallet = await new CreateWallet(
+    new MikroOrmWalletOpeningStore(database()),
+  ).execute({
+    playerId,
+    initialBalance: {
+      amount: "100.00",
+      currency: "BRL",
+    },
+  });
+
+  return {
+    providerId: "provider-inbox-test",
+    externalTransactionId: crypto.randomUUID(),
+    idempotencyKey: crypto.randomUUID(),
+    playerId,
+    walletId: wallet.id,
+    roundId: "round-inbox-test",
+    gameId: "game-inbox-test",
+    kind: WagerTransactionKind.Bet,
+    money: {
+      amount: "25.00",
+      currency: "BRL",
+    },
+  };
+}
+
+describe("Inbox com processamento financeiro — PostgreSQL real", () => {
+  test("falha após o débito desfaz tudo e permite nova tentativa", async () => {
+    const input = await financialFixture();
+    const executor = new InboxExecutor(database());
+    const messageId = crypto.randomUUID();
+    const payloadHash = "f".repeat(64);
+
+    let transactionId = "";
+
+    await expect(
+      executor.execute(
+        "financial-test",
+        messageId,
+        payloadHash,
+        async (em) => {
+          const result = await new SubmitWager(
+            new MikroOrmWagerProcessor(database(), em),
+          ).execute(input);
+
+          transactionId = result.transactionId;
+
+          expect(result.balance?.amount).toBe("75.00");
+
+          throw new Error("failure_after_financial_processing");
+        },
+      ),
+    ).rejects.toThrow("failure_after_financial_processing");
+
+    const em = database().em.fork();
+
+    const wallet = await em.findOneOrFail(WalletRecord, {
+      id: input.walletId,
+    });
+
+    expect(wallet.balance).toBe("100.00");
+    expect(wallet.version).toBe(1);
+
+    expect(
+      await em.count(WalletLedgerEntryRecord, {
+        walletId: input.walletId,
+      }),
+    ).toBe(1);
+
+    expect(
+      await em.count(WagerTransactionRecord, {
+        id: transactionId,
+      }),
+    ).toBe(0);
+
+    expect(
+      await em.count(OutboxEventRecord, {
+        aggregateId: transactionId,
+      }),
+    ).toBe(0);
+
+    expect(
+      await em.count(InboxMessageRecord, {
+        consumerName: "financial-test",
+        messageId,
+      }),
+    ).toBe(0);
+
+    const retry = await executor.execute(
+      "financial-test",
+      messageId,
+      payloadHash,
+      async (transactionEm) => {
+        const result = await new SubmitWager(
+          new MikroOrmWagerProcessor(database(), transactionEm),
+        ).execute(input);
+
+        transactionId = result.transactionId;
+      },
+    );
+
+    expect(retry).toBe("processed");
+
+    const committed = database().em.fork();
+
+    const updatedWallet = await committed.findOneOrFail(
+      WalletRecord,
+      { id: input.walletId },
+    );
+
+    expect(updatedWallet.balance).toBe("75.00");
+    expect(updatedWallet.version).toBe(2);
+
+    expect(
+      await committed.count(WalletLedgerEntryRecord, {
+        walletId: input.walletId,
+      }),
+    ).toBe(2);
+
+    expect(
+      await committed.count(WagerTransactionRecord, {
+            id: transactionId,
+            status: WagerTransactionStatus.Processed,
+        }),
+        ).toBe(1);
+
+    expect(
+      await committed.count(OutboxEventRecord, {
+        aggregateId: transactionId,
+      }),
+    ).toBe(1);
+
+    expect(
+      await committed.count(InboxMessageRecord, {
+        consumerName: "financial-test",
+        messageId,
+      }),
+    ).toBe(1);
+  });
+
+  test("20 entregas concorrentes geram apenas um débito e um evento", async () => {
+    const input = await financialFixture();
+    const messageId = crypto.randomUUID();
+    let handlerCalls = 0;
+
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        new InboxExecutor(database()).execute(
+          "financial-test",
+          messageId,
+          "a".repeat(64),
+          async (em) => {
+            handlerCalls += 1;
+
+            await new SubmitWager(
+              new MikroOrmWagerProcessor(database(), em),
+            ).execute(input);
+          },
+        ),
+      ),
+    );
+
+    expect(handlerCalls).toBe(1);
+
+    expect(
+      results.filter((result) => result === "processed"),
+    ).toHaveLength(1);
+
+    expect(
+      results.filter((result) => result === "duplicate"),
+    ).toHaveLength(19);
+
+    const em = database().em.fork();
+
+    const wallet = await em.findOneOrFail(WalletRecord, {
+      id: input.walletId,
+    });
+
+    expect(wallet.balance).toBe("75.00");
+    expect(wallet.version).toBe(2);
+
+    expect(
+      await em.count(WalletLedgerEntryRecord, {
+        walletId: input.walletId,
+      }),
+    ).toBe(2);
+
+    const transaction = await em.findOneOrFail(
+      WagerTransactionRecord,
+      {
+        providerId: input.providerId,
+        externalTransactionId: input.externalTransactionId,
+      },
+    );
+
+    expect(transaction.status).toBe(
+        WagerTransactionStatus.Processed,
+    );
+
+    expect(
+      await em.count(OutboxEventRecord, {
+        aggregateId: transaction.id,
+      }),
+    ).toBe(1);
+
+    expect(
+      await em.count(InboxMessageRecord, {
+        consumerName: "financial-test",
+        messageId,
+      }),
+    ).toBe(1);
+  });
+});

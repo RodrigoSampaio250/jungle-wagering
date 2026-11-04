@@ -3,7 +3,10 @@ import {
   LockMode,
   UniqueConstraintViolationException,
 } from "@mikro-orm/core";
-import type { MikroORM } from "@mikro-orm/postgresql";
+import type {
+  EntityManager,
+  MikroORM,
+} from "@mikro-orm/postgresql";
 import {
   ExternalTransactionConflictError,
   IdempotencyConflictError,
@@ -30,7 +33,10 @@ import { OutboxEventRecord } from "./outbox-event.record";
 import { transactionOutboxEvent } from "./transaction-outbox-event";
 
 export class MikroOrmWagerProcessor implements WagerProcessor {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(
+    private readonly orm: MikroORM,
+    private readonly transactionManager?: EntityManager,
+  ) {}
 
   async process(
     transaction: WagerTransaction,
@@ -42,9 +48,9 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
         throw error;
       }
 
-      // Uma requisição concorrente pode ter reservado a mesma chave.
-      // A transação anterior já foi revertida antes desta consulta.
-      const em = this.orm.em.fork();
+      // A tentativa de inserção já foi revertida.
+      // No consumidor, a consulta permanece na transação da inbox.
+      const em = this.transactionManager ?? this.orm.em.fork();
 
       const existing = await em.findOne(WagerTransactionRecord, {
         idempotencyKey: transaction.idempotencyKey,
@@ -74,7 +80,9 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
   private async processNew(
     transaction: WagerTransaction,
   ): Promise<WagerProcessingResult> {
-    return this.orm.em.fork().transactional(async (em) => {
+    const manager = this.transactionManager ?? this.orm.em.fork();
+
+    return manager.transactional(async (em) => {
       // Reserva a identidade antes de bloquear a carteira.
       // As restrições UNIQUE arbitram requisições concorrentes.
       await em.insert(
