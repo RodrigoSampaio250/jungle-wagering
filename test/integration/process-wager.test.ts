@@ -297,4 +297,402 @@ describe("ProcessWager — PostgreSQL real", () => {
     expect(current.wagers).toBe("1");
     expect(current.entries).toBe("2");
   });
+    test("REFUND devolve o valor de uma aposta processada", async () => {
+    const wallet = await openWallet();
+    const original = bet(wallet);
+
+    await submit().execute(original);
+
+    const refund = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Refund,
+      referenceExternalTransactionId:
+        original.externalTransactionId,
+    });
+
+    expect(refund.status).toBe(Status.Processed);
+    expect(refund.balance?.amount).toBe("100.00");
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "100.00",
+      version: 3,
+      entries: "3",
+      wagers: "2",
+      ledger_balance: "100.00",
+    });
+  });
+
+  test("dois REFUND concorrentes não devolvem a mesma aposta duas vezes", async () => {
+    const wallet = await openWallet();
+    const original = bet(wallet);
+
+    await submit().execute(original);
+
+    const results = await Promise.all([
+      submit().execute({
+        ...bet(wallet),
+        kind: Kind.Refund,
+        referenceExternalTransactionId:
+          original.externalTransactionId,
+      }),
+      submit().execute({
+        ...bet(wallet),
+        kind: Kind.Refund,
+        referenceExternalTransactionId:
+          original.externalTransactionId,
+      }),
+    ]);
+
+    expect(
+      results.filter((result) => result.status === Status.Processed),
+    ).toHaveLength(1);
+
+    const rejected = results.find(
+      (result) => result.status === Status.Rejected,
+    );
+
+    expect(rejected?.failureCode).toBe(
+      FailureCode.ReferenceAlreadyReversed,
+    );
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "100.00",
+      version: 3,
+      entries: "3",
+      wagers: "3",
+      ledger_balance: "100.00",
+    });
+  });
+
+  test("ROLLBACK de BET credita o valor de volta", async () => {
+    const wallet = await openWallet();
+    const original = bet(wallet);
+
+    await submit().execute(original);
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Rollback,
+      referenceExternalTransactionId:
+        original.externalTransactionId,
+    });
+
+    expect(result.status).toBe(Status.Processed);
+    expect(result.balance?.amount).toBe("100.00");
+
+    const current = await state(wallet.id);
+    expect(current.balance).toBe("100.00");
+    expect(current.ledger_balance).toBe("100.00");
+    expect(current.version).toBe(3);
+    expect(current.entries).toBe("3");
+  });
+
+  test("ROLLBACK de WIN debita o crédito recebido", async () => {
+    const wallet = await openWallet();
+    const original = {
+      ...bet(wallet),
+      kind: Kind.Win,
+    };
+
+    await submit().execute(original);
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Rollback,
+      referenceExternalTransactionId:
+        original.externalTransactionId,
+    });
+
+    expect(result.status).toBe(Status.Processed);
+    expect(result.balance?.amount).toBe("100.00");
+
+    const current = await state(wallet.id);
+    expect(current.balance).toBe("100.00");
+    expect(current.ledger_balance).toBe("100.00");
+    expect(current.version).toBe(3);
+  });
+
+  test("ROLLBACK de REFUND desfaz a devolução", async () => {
+    const wallet = await openWallet();
+    const original = bet(wallet);
+
+    await submit().execute(original);
+
+    const refundInput = {
+      ...bet(wallet),
+      kind: Kind.Refund,
+      referenceExternalTransactionId:
+        original.externalTransactionId,
+    };
+
+    await submit().execute(refundInput);
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Rollback,
+      referenceExternalTransactionId:
+        refundInput.externalTransactionId,
+    });
+
+    expect(result.status).toBe(Status.Processed);
+    expect(result.balance?.amount).toBe("75.00");
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "75.00",
+      version: 4,
+      entries: "4",
+      wagers: "3",
+      ledger_balance: "75.00",
+    });
+  });
+
+  test("ROLLBACK sem saldo falha com código específico e sem ledger", async () => {
+    const wallet = await openWallet();
+    const winInput = {
+      ...bet(wallet),
+      kind: Kind.Win,
+    };
+
+    await submit().execute(winInput);
+
+    await submit().execute({
+      ...bet(wallet),
+      money: { amount: "120.00", currency: "BRL" },
+    });
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Rollback,
+      referenceExternalTransactionId:
+        winInput.externalTransactionId,
+    });
+
+    expect(result.status).toBe(Status.Failed);
+    expect(result.failureCode).toBe(
+      FailureCode.ReversalInsufficientBalance,
+    );
+    expect(result.balance?.amount).toBe("5.00");
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "5.00",
+      version: 3,
+      entries: "3",
+      wagers: "3",
+      ledger_balance: "5.00",
+    });
+  });
+
+  test("LOSS de valor zero não altera saldo nem versão e não gera ledger", async () => {
+    const wallet = await openWallet();
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Loss,
+      money: { amount: "0.00", currency: "BRL" },
+    });
+
+    expect(result.status).toBe(Status.Processed);
+    expect(result.balance?.amount).toBe("100.00");
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "100.00",
+      version: 1,
+      entries: "1",
+      wagers: "1",
+      ledger_balance: "100.00",
+    });
+  });
+
+  test("referência ausente fica pendente sem movimentar saldo", async () => {
+    const wallet = await openWallet();
+
+    const input = {
+      ...bet(wallet),
+      kind: Kind.Refund,
+      referenceExternalTransactionId: crypto.randomUUID(),
+    };
+
+    const result = await submit().execute(input);
+
+    expect(result.status).toBe(Status.PendingReference);
+    expect(result.failureCode).toBeNull();
+    expect(result.balance?.amount).toBe("100.00");
+
+    const replay = await submit().execute(input);
+
+    expect(replay.transactionId).toBe(result.transactionId);
+    expect(replay.status).toBe(Status.PendingReference);
+    expect(replay.idempotentReplay).toBe(true);
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "100.00",
+      version: 1,
+      entries: "1",
+      wagers: "1",
+      ledger_balance: "100.00",
+    });
+  });
+
+  test("REFUND com valor diferente da aposta é rejeitado", async () => {
+    const wallet = await openWallet();
+    const original = bet(wallet);
+
+    await submit().execute(original);
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Refund,
+      money: { amount: "20.00", currency: "BRL" },
+      referenceExternalTransactionId:
+        original.externalTransactionId,
+    });
+
+    expect(result.status).toBe(Status.Rejected);
+    expect(result.failureCode).toBe(
+      FailureCode.ReferenceAmountMismatch,
+    );
+
+    const current = await state(wallet.id);
+    expect(current.balance).toBe("75.00");
+    expect(current.ledger_balance).toBe("75.00");
+    expect(current.version).toBe(2);
+    expect(current.entries).toBe("2");
+  });
+
+  test("REFUND não pode referenciar uma operação WIN", async () => {
+    const wallet = await openWallet();
+    const original = {
+      ...bet(wallet),
+      kind: Kind.Win,
+    };
+
+    await submit().execute(original);
+
+    const result = await submit().execute({
+      ...bet(wallet),
+      kind: Kind.Refund,
+      referenceExternalTransactionId:
+        original.externalTransactionId,
+    });
+
+    expect(result.status).toBe(Status.Rejected);
+    expect(result.failureCode).toBe(
+      FailureCode.InvalidReferenceKind,
+    );
+
+    const current = await state(wallet.id);
+    expect(current.balance).toBe("125.00");
+    expect(current.ledger_balance).toBe("125.00");
+    expect(current.version).toBe(2);
+    expect(current.entries).toBe("2");
+  });
+    test("falha no ledger desfaz o débito e permite repetir a requisição", async () => {
+    const wallet = await openWallet();
+    const input = bet(wallet);
+    const em = database().em.fork();
+
+    // A falha será instalada apenas no banco temporário de teste.
+    await em.execute(`
+      CREATE FUNCTION simulate_wager_ledger_failure()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        RAISE EXCEPTION 'simulated_ledger_failure';
+      END;
+      $$;
+    `);
+
+    try {
+      // wallet.id é um UUID gerado internamente pela abertura.
+      await em.execute(`
+        CREATE TRIGGER simulate_wager_ledger_failure_trigger
+        BEFORE INSERT ON wallet_ledger_entries
+        FOR EACH ROW
+        WHEN (NEW.wallet_id = '${wallet.id}'::uuid)
+        EXECUTE FUNCTION simulate_wager_ledger_failure();
+      `);
+
+      try {
+        await expect(
+          submit().execute(input),
+        ).rejects.toThrow("simulated_ledger_failure");
+
+        // O processador tentou atualizar a carteira antes do ledger.
+        // Mesmo assim, a falha deve desfazer a operação inteira.
+        expect(await state(wallet.id)).toEqual({
+          balance: "100.00",
+          version: 1,
+          entries: "1",
+          wagers: "0",
+          ledger_balance: "100.00",
+        });
+      } finally {
+        await em.execute(`
+          DROP TRIGGER IF EXISTS
+            simulate_wager_ledger_failure_trigger
+          ON wallet_ledger_entries;
+        `);
+      }
+    } finally {
+      await em.execute(`
+        DROP FUNCTION IF EXISTS simulate_wager_ledger_failure();
+      `);
+    }
+
+    // A mesma chave pode ser tentada novamente porque nada foi confirmado.
+    const retry = await submit().execute(input);
+
+    expect(retry.status).toBe(Status.Processed);
+    expect(retry.idempotentReplay).toBe(false);
+    expect(retry.balance?.amount).toBe("75.00");
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "75.00",
+      version: 2,
+      entries: "2",
+      wagers: "1",
+      ledger_balance: "75.00",
+    });
+  });
+    test("banco rejeita alteração de saldo sem ledger", async () => {
+    const wallet = await openWallet();
+
+    await expect(
+      database().em.fork().transactional(async (em) => {
+        await em.execute(
+          `UPDATE wallets SET balance = '999.00' WHERE id = ?`,
+          [wallet.id],
+        );
+      }),
+    ).rejects.toThrow("wallet_ledger_balance_mismatch");
+
+    expect(await state(wallet.id)).toEqual({
+      balance: "100.00",
+      version: 1,
+      entries: "1",
+      wagers: "0",
+      ledger_balance: "100.00",
+    });
+  });
+
+  test("banco rejeita alteração de versão sem movimentação", async () => {
+    const wallet = await openWallet();
+
+    await expect(
+      database().em.fork().transactional(async (em) => {
+        await em.execute(
+          `UPDATE wallets SET version = version + 1 WHERE id = ?`,
+          [wallet.id],
+        );
+      }),
+    ).rejects.toThrow("wallet_ledger_version_mismatch");
+
+    const current = await state(wallet.id);
+
+    expect(current.version).toBe(1);
+    expect(current.balance).toBe("100.00");
+    expect(current.ledger_balance).toBe("100.00");
+  });
 });
+
