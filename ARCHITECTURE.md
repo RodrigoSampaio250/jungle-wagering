@@ -129,7 +129,7 @@ Erros de infraestrutura que lançam exceção não são automaticamente persisti
 
 A entrada usa FIFO, envelope `WagerTransactionRequested` e agrupamento por carteira no produtor de demonstração. A consistência financeira continua no PostgreSQL, mesmo diante de duplicatas ou acesso simultâneo por HTTP.
 
-Após resultado de negócio confirmado, o consumidor pode enviar o ack. Mensagens inválidas ou execuções que falham não recebem ack e seguem a política de reentrega e redrive. A entrada usa visibilidade de 60 segundos e máximo de cinco recebimentos antes da DLQ. Há uma pausa de dois segundos no loop após erro; ela não equivale a backoff exponencial de visibilidade por mensagem.
+Após resultado de negócio confirmado, o consumidor pode enviar o ack. Mensagens inválidas ou execuções que falham não recebem ack e seguem a política de reentrega e redrive. A entrada usa visibilidade inicial de 60 segundos e máximo de cinco recebimentos antes da DLQ. Após falha transitória, o consumidor solicita visibilidade de 2, 4, 8 segundos e assim por diante, limitada a 300 segundos. Falhas de decodificação e conflitos ou validações de negócio lançados como exceção são classificados como permanentes e liberam a visibilidade para avançar o redrive. Resultados de rejeição retornados normalmente recebem ack. Exceções não reconhecidas são tratadas conservadoramente como transitórias, dentro do limite de recebimentos. Uma falha ao alterar a visibilidade é registrada sem substituir a exceção original.
 
 ## Logs e métricas
 
@@ -143,7 +143,7 @@ Resultados financeiros da fila são observados depois do commit externo. Uma fun
 
 O lag do outbox é observado na publicação bem-sucedida. Não representa a idade instantânea do evento pendente mais antigo. A métrica de DLQ consulta quantidades aproximadas por estado, sem consumir mensagens, e expõe sucesso da coleta. Falha de consulta não é apresentada como fila vazia.
 
-Conflitos de lock estão instrumentados no caminho HTTP. Não há contagem equivalente em todos os caminhos dos workers. Contadores reiniciam com o processo; para histórico e agregação entre instâncias, é necessário coletor externo. O Compose não inclui Prometheus, dashboard ou tracing distribuído.
+Conflitos de lock estão instrumentados no caminho HTTP e no tratamento de falhas do consumidor SQS. Não há contagem equivalente em todos os caminhos dos workers de outbox e referências. Contadores reiniciam com o processo; para histórico e agregação entre instâncias, é necessário coletor externo. O Compose não inclui Prometheus, dashboard ou tracing distribuído.
 
 ## Autenticação
 
@@ -153,10 +153,10 @@ Para uma integração real, a validação pode ser substituída por API key, ass
 
 ## Evidências e limites
 
-A execução final registrada teve 142 testes passando em 16 arquivos. Há testes de dinheiro, schema, idempotência concorrente, disputa de saldo, rollback conjunto, referências, publishers concorrentes, HTTP, recuperação após queda entre commit e ack e reversibilidade das migrations.
+A execução final registrada teve 144 testes passando em 17 arquivos. Há testes de dinheiro, schema, idempotência concorrente, disputa de saldo, rollback conjunto, referências, publishers concorrentes, HTTP, recuperação após queda entre commit e ack e reversibilidade das migrations.
 
-Também foram executados scripts com três APIs reais do Compose e com duas entregas FIFO para a mesma identidade de aplicação. A DLQ foi verificada manualmente com LocalStack, e os endpoints de métricas foram consultados por processo.
+Também foram executados scripts com três APIs reais do Compose e com duas entregas FIFO para a mesma identidade de aplicação. O teste automatizado de retry/DLQ verifica rollback financeiro após falha transitória, reentrega natural com backoff e processamento único. Outro cenário envia JSON inválido e verifica sua chegada à DLQ após duas tentativas em filas exclusivas. A configuração da aplicação permanece em cinco recebimentos. Os endpoints de métricas foram consultados por processo.
 
-Essas evidências não demonstram uma meta de throughput ou latência sob carga. O cenário de crash usa uma fila exclusiva e um processo filho, não um encerramento aleatório de toda a composição. O redrive completo até a DLQ ainda foi validado manualmente, sem teste automatizado dedicado. A classificação de indisponibilidade transitória como 503 está no caminho de submissão HTTP, sem filtro global equivalente em todos os endpoints.
+Essas evidências não demonstram uma meta de throughput ou latência sob carga. O cenário de crash usa uma fila exclusiva e um processo filho, não um encerramento aleatório de toda a composição. A classificação de indisponibilidade transitória como 503 está no caminho de submissão HTTP, sem filtro global equivalente em todos os endpoints.
 
 Os limites operacionais acima fazem parte do estado atual da implementação. São pontos para evolução e para comparação explícita com o nível de completude exigido, sem atribuir aos testes uma garantia maior do que eles verificam.

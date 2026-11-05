@@ -94,20 +94,21 @@ bun run typecheck
 bun test
 ```
 
-A última execução validada passou com **142 testes, zero falhas e 496 verificações, em 16 arquivos**. Isso registra a execução realizada; não representa uma medição de cobertura de linhas ou de desempenho.
+A última execução validada passou com **144 testes, zero falhas e 509 verificações, em 17 arquivos**. Isso registra a execução realizada; não representa uma medição de cobertura de linhas ou de desempenho.
 
 Os testes de integração criam bancos temporários. O usuário de teste precisa poder criar e remover bancos, como acontece na configuração local do Compose. Execute a suíte em ambiente de desenvolvimento ou teste.
 
-Dois cenários podem ser executados separadamente:
+Os cenários de recuperação, migrations e retry/DLQ podem ser executados separadamente:
 
 ```bash
 bun test test/integration/crash-recovery.test.ts
 bun test test/integration/migrations.test.ts
+bun test test/integration/sqs-retry-dlq.test.ts
 ```
 
 O primeiro cria uma fila FIFO exclusiva e um banco temporário. Um processo filho confirma o débito e é encerrado antes do ack. Outro processo recebe a mensagem como duplicata, sem repetir saldo, ledger, transação ou eventos. O teste antecipa a visibilidade da mensagem para não esperar os 60 segundos configurados no consumidor.
 
-O segundo aplica as cinco migrations, cria uma carteira, reverte todas, reaplica e verifica novamente a persistência.
+O teste de migrations aplica as cinco versões, cria uma carteira, reverte todas, reaplica e verifica novamente a persistência. O teste de retry/DLQ provoca uma falha depois do processamento financeiro, verifica o rollback, aguarda reentrega com backoff e confirma um único débito. Também verifica uma mensagem inválida chegando à DLQ após duas tentativas em uma fila exclusiva de teste.
 
 ### Validações com os serviços completos
 
@@ -253,8 +254,8 @@ curl -fsS http://localhost:9103/metrics
 
 Cada processo mantém suas próprias métricas. Os contadores reiniciam com ele; não substituem o ledger nem são um histórico financeiro persistente. Não há servidor Prometheus ou dashboard incluído no Compose.
 
-Há métricas de resultados, replay, duplicatas da inbox, reentregas, falhas por fase, publicações, lag observado na publicação, referências e divergências de reconciliação. Conflitos de lock são contados no caminho HTTP instrumentado. A DLQ expõe quantidade aproximada por estado e sucesso da consulta; ela não é consumida pela coleta.
+Há métricas de resultados, replay, duplicatas da inbox, reentregas, falhas por fase, publicações, lag observado na publicação, referências e divergências de reconciliação. Conflitos de lock são contados no caminho HTTP e no tratamento de falhas do consumidor SQS instrumentados. A DLQ expõe quantidade aproximada por estado e sucesso da consulta; ela não é consumida pela coleta.
 
-O prazo de referência é de uma hora por padrão. Referências e publicações usam reagendamento exponencial limitado a 60 segundos. Na entrada SQS, a visibilidade é de 60 segundos e a política de redrive permite cinco recebimentos antes da DLQ; o consumidor ainda não altera a visibilidade com backoff exponencial por mensagem.
+O prazo de referência é de uma hora por padrão. Referências e publicações usam reagendamento exponencial limitado a 60 segundos. Na entrada SQS, a visibilidade inicial é de 60 segundos. Falhas transitórias reagendam a visibilidade em 2, 4, 8 segundos e assim por diante, limitadas a 300 segundos. Falhas classificadas como permanentes liberam a visibilidade para seguir o redrive. A fila da aplicação permite cinco recebimentos antes da DLQ. Se a alteração de visibilidade falhar, o consumidor preserva a exceção original e a visibilidade anterior determina a reentrega.
 
 `SIGINT` e `SIGTERM` interrompem novas iterações e permitem concluir a operação em andamento antes de fechar as conexões. Os limites de rastreabilidade e os cenários ainda não automatizados estão detalhados no documento de arquitetura.
