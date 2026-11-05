@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { UniqueConstraintViolationException } from "@mikro-orm/core";
 import type {
   EntityManager,
   MikroORM,

@@ -9,8 +9,14 @@ import { WalletRecord } from "./wallet.record";
 import { WagerTransactionRecord } from "./wager-transaction.record";
 import { WalletLedgerEntryRecord } from "./wallet-ledger-entry.record";
 import { OutboxEventRecord } from "./outbox-event.record";
-import { transactionOutboxEvent } from "./transaction-outbox-event";
-import { transactionToRecord } from "./wager-mappers";
+import {
+  balanceChangedOutboxEvent,
+  transactionOutboxEvent,
+} from "./transaction-outbox-event";
+import {
+  ledgerEntryToRecord,
+  transactionToRecord,
+} from "./wager-mappers";
 
 export class MikroOrmWalletOpeningStore
   implements WalletOpeningStore {
@@ -42,56 +48,33 @@ export class MikroOrmWalletOpeningStore
           return;
         }
 
-        await em.insert(WagerTransactionRecord, {
-          id: transaction.id,
-          providerId: transaction.providerId,
-          externalTransactionId: transaction.externalTransactionId,
-          idempotencyKey: transaction.idempotencyKey,
-          payloadHash: transaction.payloadHash,
-          walletId: transaction.walletId,
-          playerId: transaction.playerId,
-          roundId: transaction.roundId,
-          gameId: transaction.gameId,
-          kind: transaction.kind,
-          amount: transaction.money.toString(),
-          currency: transaction.money.currency,
-          status: transaction.status,
-          referenceExternalTransactionId:
-            transaction.referenceExternalTransactionId ?? null,
-          referenceTransactionId:
-            transaction.referenceTransactionId ?? null,
-          failureCode: transaction.failureCode ?? null,
-          resultBalance: wallet.balance.toString(),
-          referenceAttempts: 0,
-          nextReferenceAttemptAt: null,
-          createdAt: transaction.createdAt,
-          processedAt: transaction.processedAt ?? null,
-        });
-
-        await em.insert(WalletLedgerEntryRecord, {
-          id: entry.id,
-          walletId: entry.walletId,
-          transactionId: entry.transactionId,
-          direction: entry.direction,
-          amount: entry.money.toString(),
-          currency: entry.money.currency,
-          balanceBefore: entry.balanceBefore.toString(),
-          balanceAfter: entry.balanceAfter.toString(),
-          createdAt: entry.createdAt,
-        });
-
-        const event = transactionOutboxEvent(
-          transactionToRecord(
-            transaction,
-            wallet.balance.toString(),
-          ),
+        const record = transactionToRecord(
+          transaction,
+          wallet.balance.toString(),
         );
+
+        await em.insert(
+          WagerTransactionRecord,
+          record,
+        );
+
+        await em.insert(
+          WalletLedgerEntryRecord,
+          ledgerEntryToRecord(entry),
+        );
+
+        const event = transactionOutboxEvent(record);
 
         if (event) {
           await em.insert(OutboxEventRecord, event);
         }
+
+        await em.insert(
+          OutboxEventRecord,
+          balanceChangedOutboxEvent(entry, wallet.version),
+        );
       });
-    } catch (error: unknown) {
+    } catch (error) {
       if (
         error instanceof UniqueConstraintViolationException &&
         error.message.includes("wallets_player_currency_unique")

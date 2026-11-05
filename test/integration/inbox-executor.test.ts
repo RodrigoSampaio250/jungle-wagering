@@ -359,11 +359,17 @@ describe("Inbox com processamento financeiro — PostgreSQL real", () => {
         }),
         ).toBe(1);
 
+    const committedEvents = await committed.find(
+      OutboxEventRecord,
+      { aggregateId: transactionId },
+    );
+
     expect(
-      await committed.count(OutboxEventRecord, {
-        aggregateId: transactionId,
-      }),
-    ).toBe(1);
+      committedEvents.map((event) => event.eventType).sort(),
+    ).toEqual([
+      "WagerTransactionProcessed",
+      "WalletBalanceChanged",
+    ]);
 
     expect(
       await committed.count(InboxMessageRecord, {
@@ -373,7 +379,7 @@ describe("Inbox com processamento financeiro — PostgreSQL real", () => {
     ).toBe(1);
   });
 
-  test("20 entregas concorrentes geram apenas um débito e um evento", async () => {
+  test("20 entregas concorrentes geram um único débito e um evento de cada tipo", async () => {
     const input = await financialFixture();
     const messageId = crypto.randomUUID();
     let handlerCalls = 0;
@@ -432,11 +438,17 @@ describe("Inbox com processamento financeiro — PostgreSQL real", () => {
         WagerTransactionStatus.Processed,
     );
 
+    const events = await em.find(
+      OutboxEventRecord,
+      { aggregateId: transaction.id },
+    );
+
     expect(
-      await em.count(OutboxEventRecord, {
-        aggregateId: transaction.id,
-      }),
-    ).toBe(1);
+      events.map((event) => event.eventType).sort(),
+    ).toEqual([
+      "WagerTransactionProcessed",
+      "WalletBalanceChanged",
+    ]);
 
     expect(
       await em.count(InboxMessageRecord, {

@@ -1,6 +1,6 @@
 import type { SQSClient } from "@aws-sdk/client-sqs";
 import type { MikroORM } from "@mikro-orm/postgresql";
-import { isUUID } from "class-validator";
+import { isISO8601, isUUID } from "class-validator";
 import { canonicalPayloadHash } from "../../application/canonical-payload-hash";
 import {
   SubmitWager,
@@ -9,7 +9,10 @@ import {
 import { WagerTransactionKind } from "../../domain/wager-transaction.types";
 import { InboxExecutor } from "../database/inbox-executor";
 import { MikroOrmWagerProcessor } from "../database/mikro-orm-wager-processor";
-import { SqsInboxConsumer } from "./sqs-inbox-consumer";
+import {
+  SqsInboxConsumer,
+  type InboxEnvelope,
+} from "./sqs-inbox-consumer";
 
 function objectValue(
   value: unknown,
@@ -43,21 +46,42 @@ function text(
   return value;
 }
 
-function decode(body: string) {
-  const raw = objectValue(JSON.parse(body));
-  const money = objectValue(raw.money);
+export function decodeWagerMessage(
+  body: string,
+): InboxEnvelope<SubmitWagerInput> {
+  const envelope = objectValue(JSON.parse(body));
 
-  const messageId = text(raw, "messageId", 200);
-  const playerId = text(raw, "playerId", 36);
-  const walletId = text(raw, "walletId", 36);
+  const messageId = text(envelope, "messageId", 200);
+  const type = text(envelope, "type", 100);
+  const occurredAt = text(envelope, "occurredAt", 50);
+
+  if (type !== "WagerTransactionRequested") {
+    throw new Error("Tipo de mensagem não suportado.");
+  }
+
+  if (
+    !isISO8601(occurredAt, {
+      strict: true,
+      strictSeparator: true,
+    }) ||
+    !Number.isFinite(Date.parse(occurredAt))
+  ) {
+    throw new Error("occurredAt deve ser uma data ISO-8601 válida.");
+  }
+
+  const data = objectValue(envelope.data);
+  const money = objectValue(data.money);
+
+  const playerId = text(data, "playerId", 36);
+  const walletId = text(data, "walletId", 36);
 
   if (!isUUID(playerId) || !isUUID(walletId)) {
     throw new Error("playerId e walletId devem ser UUIDs.");
   }
 
-  const kind = text(raw, "kind", 20);
+  const kind = text(data, "kind", 20);
 
-  const allowedKinds = [
+  const allowedKinds: WagerTransactionKind[] = [
     WagerTransactionKind.Bet,
     WagerTransactionKind.Win,
     WagerTransactionKind.Loss,
@@ -80,19 +104,23 @@ function decode(body: string) {
   }
 
   const payload: SubmitWagerInput = {
-    providerId: text(raw, "providerId", 100),
-    externalTransactionId: text(raw, "externalTransactionId", 200),
-    idempotencyKey: text(raw, "idempotencyKey", 300),
+    providerId: text(data, "providerId", 100),
+    externalTransactionId: text(
+      data,
+      "externalTransactionId",
+      200,
+    ),
+    idempotencyKey: text(data, "idempotencyKey", 300),
     playerId,
     walletId,
-    roundId: text(raw, "roundId", 200),
-    gameId: text(raw, "gameId", 200),
+    roundId: text(data, "roundId", 200),
+    gameId: text(data, "gameId", 200),
     kind: kind as WagerTransactionKind,
     money: { amount, currency },
-    ...(raw.referenceExternalTransactionId !== undefined
+    ...(data.referenceExternalTransactionId !== undefined
       ? {
           referenceExternalTransactionId: text(
-            raw,
+            data,
             "referenceExternalTransactionId",
             200,
           ),
@@ -133,12 +161,11 @@ export function createWagerConsumer(
     queueUrl,
     "wager-transactions-v1",
     new InboxExecutor(orm),
-    decode,
+    decodeWagerMessage,
     async (em, payload) => {
       const processor = new MikroOrmWagerProcessor(orm, em);
-      const submitWager = new SubmitWager(processor);
 
-      await submitWager.execute(payload);
+      await new SubmitWager(processor).execute(payload);
     },
   );
 }

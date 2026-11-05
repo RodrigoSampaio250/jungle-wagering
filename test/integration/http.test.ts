@@ -540,7 +540,7 @@ describe("API HTTP — PostgreSQL real", () => {
     });
   });
 
-  test("readiness verifica o banco", async () => {
+  test("readiness verifica PostgreSQL e SQS", async () => {
     const response = await fetch(
       `${baseUrl}/health/ready`,
     );
@@ -549,6 +549,7 @@ describe("API HTTP — PostgreSQL real", () => {
     expect(await response.json()).toEqual({
       status: "ok",
       database: "up",
+      sqs: "up",
     });
   });
 });

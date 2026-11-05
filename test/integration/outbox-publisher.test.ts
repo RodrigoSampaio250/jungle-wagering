@@ -77,10 +77,10 @@ async function seedEvent(): Promise<string> {
   await database().em.fork().insert(OutboxEventRecord, {
     id,
     aggregateId: crypto.randomUUID(),
-    eventType: "transaction.processed",
+    eventType: "WagerTransactionProcessed",
     payload: {
       eventId: id,
-      eventType: "transaction.processed",
+      eventType: "WagerTransactionProcessed",
     },
     createdAt: at,
     publishedAt: null,

@@ -127,7 +127,7 @@ async function makeDue(transactionId: string) {
 }
 
 describe("ReferenceWorker — PostgreSQL real", () => {
-  test("sem referência, agenda outra tentativa sem movimentar saldo", async () => {
+  test("sem referência, agenda outra tentativa sem repetir evento nem movimentar saldo", async () => {
     const { wallet, refund, submit } = await fixture();
     const pending = await submit.execute(refund);
 
@@ -157,10 +157,13 @@ describe("ReferenceWorker — PostgreSQL real", () => {
       transaction.nextReferenceAttemptAt!.getTime(),
     ).toBeGreaterThanOrEqual(before + 2_000);
 
-    expect(
-      (await em.findOneOrFail(WalletRecord, { id: wallet.id }))
-        .balance,
-    ).toBe("100.00");
+    const currentWallet = await em.findOneOrFail(
+      WalletRecord,
+      { id: wallet.id },
+    );
+
+    expect(currentWallet.balance).toBe("100.00");
+    expect(currentWallet.version).toBe(1);
 
     expect(
       await em.count(WalletLedgerEntryRecord, {
@@ -168,13 +171,31 @@ describe("ReferenceWorker — PostgreSQL real", () => {
       }),
     ).toBe(1);
 
-    expect(
-      await em.count(OutboxEventRecord, {
-        aggregateId: pending.transactionId,
-      }),
-    ).toBe(0);
+    const pendingEvents = await em.find(
+      OutboxEventRecord,
+      { aggregateId: pending.transactionId },
+    );
 
-    // Deixa este registro fora das próximas seleções do teste.
+    expect(
+      pendingEvents.map((event) => event.eventType),
+    ).toEqual([
+      "WagerTransactionPendingReference",
+    ]);
+
+    expect(pendingEvents[0]?.payload).toMatchObject({
+      aggregateId: pending.transactionId,
+      correlationId: pending.transactionId,
+      version: 1,
+      data: {
+        transactionId: pending.transactionId,
+        walletId: wallet.id,
+        status: "PENDING_REFERENCE",
+        referenceExternalTransactionId:
+          refund.referenceExternalTransactionId,
+      },
+    });
+
+    // Evita que este registro participe dos próximos testes.
     await em.nativeUpdate(
       WagerTransactionRecord,
       { id: pending.transactionId },
@@ -197,7 +218,10 @@ describe("ReferenceWorker — PostgreSQL real", () => {
 
     await makeDue(pending.transactionId);
 
-    const worker = new ReferenceWorker(database(), 3_600_000);
+    const worker = new ReferenceWorker(
+      database(),
+      3_600_000,
+    );
 
     const results = await Promise.all([
       worker.processOne(),
@@ -239,11 +263,43 @@ describe("ReferenceWorker — PostgreSQL real", () => {
       }),
     ).toBe(1);
 
+    const resolvedEvents = await em.find(
+      OutboxEventRecord,
+      { aggregateId: pending.transactionId },
+    );
+
     expect(
-      await em.count(OutboxEventRecord, {
-        aggregateId: pending.transactionId,
-      }),
-    ).toBe(1);
+      resolvedEvents.map((event) => event.eventType).sort(),
+    ).toEqual([
+      "WagerTransactionPendingReference",
+      "WagerTransactionProcessed",
+      "WalletBalanceChanged",
+    ]);
+
+    const balanceChanged = resolvedEvents.find(
+      (event) => event.eventType === "WalletBalanceChanged",
+    );
+
+    expect(balanceChanged?.payload).toMatchObject({
+      data: {
+        transactionId: pending.transactionId,
+        walletId: wallet.id,
+        direction: "CREDIT",
+        money: {
+          amount: "25.00",
+          currency: "BRL",
+        },
+        balanceBefore: {
+          amount: "75.00",
+          currency: "BRL",
+        },
+        balanceAfter: {
+          amount: "100.00",
+          currency: "BRL",
+        },
+        walletVersion: 3,
+      },
+    });
   });
 
   test("prazo expirado rejeita e gera evento sem movimentar saldo", async () => {
@@ -281,10 +337,13 @@ describe("ReferenceWorker — PostgreSQL real", () => {
     );
     expect(transaction.nextReferenceAttemptAt).toBeNull();
 
-    expect(
-      (await em.findOneOrFail(WalletRecord, { id: wallet.id }))
-        .balance,
-    ).toBe("100.00");
+    const currentWallet = await em.findOneOrFail(
+      WalletRecord,
+      { id: wallet.id },
+    );
+
+    expect(currentWallet.balance).toBe("100.00");
+    expect(currentWallet.version).toBe(1);
 
     expect(
       await em.count(WalletLedgerEntryRecord, {
@@ -292,11 +351,29 @@ describe("ReferenceWorker — PostgreSQL real", () => {
       }),
     ).toBe(0);
 
+    const events = await em.find(
+      OutboxEventRecord,
+      { aggregateId: pending.transactionId },
+    );
+
     expect(
-      await em.count(OutboxEventRecord, {
-        aggregateId: pending.transactionId,
-        eventType: "transaction.rejected",
-      }),
-    ).toBe(1);
+      events.map((event) => event.eventType).sort(),
+    ).toEqual([
+      "WagerTransactionPendingReference",
+      "WagerTransactionRejected",
+    ]);
+
+    const rejected = events.find(
+      (event) => event.eventType === "WagerTransactionRejected",
+    );
+
+    expect(rejected?.payload).toMatchObject({
+      data: {
+        transactionId: pending.transactionId,
+        walletId: wallet.id,
+        status: "REJECTED",
+        failureCode: "REFERENCE_EXPIRED",
+      },
+    });
   });
 });

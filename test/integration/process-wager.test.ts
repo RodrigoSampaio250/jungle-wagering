@@ -695,52 +695,97 @@ describe("ProcessWager — PostgreSQL real", () => {
     expect(current.balance).toBe("100.00");
     expect(current.ledger_balance).toBe("100.00");
   });
-    test("aposta e replay geram apenas um evento na outbox", async () => {
-    const wallet = await openWallet();
-    const input = bet(wallet);
+    test("aposta e replay geram um evento de cada tipo na outbox", async () => {
+      const wallet = await openWallet();
+      const input = bet(wallet);
 
-    const result = await submit().execute(input);
-    await submit().execute(input);
+      const result = await submit().execute(input);
+      await submit().execute(input);
 
-    const events = await database().em.fork().find(
-      OutboxEventRecord,
-      { aggregateId: result.transactionId },
-    );
+      const events = await database().em.fork().find(
+        OutboxEventRecord,
+        { aggregateId: result.transactionId },
+      );
 
-    expect(events).toHaveLength(1);
+      expect(
+        events.map((event) => event.eventType).sort(),
+      ).toEqual([
+        "WagerTransactionProcessed",
+        "WalletBalanceChanged",
+      ]);
 
-    const event = events[0];
+      const processed = events.find(
+        (event) => event.eventType === "WagerTransactionProcessed",
+      );
 
-    if (!event) {
-      throw new Error("Evento não encontrado.");
-    }
+      const balanceChanged = events.find(
+        (event) => event.eventType === "WalletBalanceChanged",
+      );
 
-    expect(event.eventType).toBe("transaction.processed");
-    expect(event.publishedAt).toBeNull();
-    expect(event.attempts).toBe(0);
-    expect(event.payload).toMatchObject({
-      eventId: event.id,
-      transactionId: result.transactionId,
-      walletId: wallet.id,
-      status: "PROCESSED",
-      money: {
-        amount: "25.00",
-        currency: "BRL",
-      },
-      balance: {
-        amount: "75.00",
-        currency: "BRL",
-      },
+      if (!processed || !balanceChanged) {
+        throw new Error("Eventos obrigatórios não encontrados.");
+      }
+
+      for (const event of events) {
+        expect(event.publishedAt).toBeNull();
+        expect(event.attempts).toBe(0);
+
+        expect(event.payload).toMatchObject({
+          eventId: event.id,
+          eventType: event.eventType,
+          aggregateId: result.transactionId,
+          correlationId: result.transactionId,
+          version: 1,
+        });
+
+        expect(
+          typeof event.payload.occurredAt,
+        ).toBe("string");
+      }
+
+      expect(processed.payload).toMatchObject({
+        data: {
+          transactionId: result.transactionId,
+          walletId: wallet.id,
+          status: "PROCESSED",
+          money: {
+            amount: "25.00",
+            currency: "BRL",
+          },
+          balance: {
+            amount: "75.00",
+            currency: "BRL",
+          },
+        },
+      });
+
+      expect(balanceChanged.payload).toMatchObject({
+        data: {
+          transactionId: result.transactionId,
+          walletId: wallet.id,
+          direction: "DEBIT",
+          money: {
+            amount: "25.00",
+            currency: "BRL",
+          },
+          balanceBefore: {
+            amount: "100.00",
+            currency: "BRL",
+          },
+          balanceAfter: {
+            amount: "75.00",
+            currency: "BRL",
+          },
+          walletVersion: 2,
+        },
+      });
     });
-  });
 
-  test("falha na outbox desfaz saldo ledger e transação", async () => {
+ test("falha na outbox desfaz saldo ledger e transação", async () => {
     const wallet = await openWallet();
     const input = bet(wallet);
     const em = database().em.fork();
 
-    // A abertura já terminou. A falha afetará apenas eventos
-    // desta carteira inseridos durante o teste.
     await em.execute(`
       CREATE FUNCTION simulate_outbox_failure()
       RETURNS trigger
@@ -758,7 +803,7 @@ describe("ProcessWager — PostgreSQL real", () => {
         BEFORE INSERT ON outbox_events
         FOR EACH ROW
         WHEN (
-          NEW.payload->>'walletId' = '${wallet.id}'
+          NEW.payload->'data'->>'walletId' = '${wallet.id}'
         )
         EXECUTE FUNCTION simulate_outbox_failure();
       `);
@@ -776,19 +821,15 @@ describe("ProcessWager — PostgreSQL real", () => {
           ledger_balance: "100.00",
         });
 
-        // Resta somente o evento da abertura da carteira.
-        expect(
-          await em.count(OutboxEventRecord, {}),
-        ).toBeGreaterThanOrEqual(1);
-
+        // Permanecem apenas os dois eventos da abertura.
         const rows = await em.execute<{ total: string }[]>(
           `SELECT count(*) AS total
-           FROM outbox_events
-           WHERE payload->>'walletId' = ?`,
+          FROM outbox_events
+          WHERE payload->'data'->>'walletId' = ?`,
           [wallet.id],
         );
 
-        expect(rows[0]?.total).toBe("1");
+        expect(rows[0]?.total).toBe("2");
       } finally {
         await em.execute(`
           DROP TRIGGER IF EXISTS simulate_outbox_failure_trigger
@@ -807,11 +848,17 @@ describe("ProcessWager — PostgreSQL real", () => {
     expect(retry.idempotentReplay).toBe(false);
     expect(retry.balance?.amount).toBe("75.00");
 
+    const events = await em.find(
+      OutboxEventRecord,
+      { aggregateId: retry.transactionId },
+    );
+
     expect(
-      await em.count(OutboxEventRecord, {
-        aggregateId: retry.transactionId,
-      }),
-    ).toBe(1);
+      events.map((event) => event.eventType).sort(),
+    ).toEqual([
+      "WagerTransactionProcessed",
+      "WalletBalanceChanged",
+    ]);
 
     expect(await state(wallet.id)).toEqual({
       balance: "75.00",

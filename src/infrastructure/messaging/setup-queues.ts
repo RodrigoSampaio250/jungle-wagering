@@ -9,17 +9,27 @@ const client = new SQSClient({
   endpoint: process.env.SQS_ENDPOINT ?? "http://127.0.0.1:4566",
   region: process.env.AWS_REGION ?? "us-east-1",
   credentials: {
-    accessKeyId: "test",
-    secretAccessKey: "test",
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? "test",
+    secretAccessKey:
+      process.env.AWS_SECRET_ACCESS_KEY ?? "test",
   },
 });
 
-async function createQueue(name: string): Promise<string> {
+async function createQueue(
+  name: string,
+  fifo: boolean,
+): Promise<string> {
   const result = await client.send(
     new CreateQueueCommand({
       QueueName: name,
       Attributes: {
         MessageRetentionPeriod: "1209600",
+        ...(fifo
+          ? {
+              FifoQueue: "true",
+              ContentBasedDeduplication: "false",
+            }
+          : {}),
       },
     }),
   );
@@ -31,8 +41,15 @@ async function createQueue(name: string): Promise<string> {
   return result.QueueUrl;
 }
 
-async function setupQueue(name: string): Promise<void> {
-  const deadLetterUrl = await createQueue(`${name}-dlq`);
+async function setupQueue(
+  name: string,
+  deadLetterName: string,
+  fifo: boolean,
+): Promise<void> {
+  const deadLetterUrl = await createQueue(
+    deadLetterName,
+    fifo,
+  );
 
   const attributes = await client.send(
     new GetQueueAttributesCommand({
@@ -47,7 +64,7 @@ async function setupQueue(name: string): Promise<void> {
     throw new Error(`DLQ de ${name} não retornou um ARN.`);
   }
 
-  const queueUrl = await createQueue(name);
+  const queueUrl = await createQueue(name, fifo);
 
   await client.send(
     new SetQueueAttributesCommand({
@@ -63,19 +80,39 @@ async function setupQueue(name: string): Promise<void> {
     }),
   );
 
-  console.log(JSON.stringify({
-    event: "queue.configured",
-    queue: name,
-    queueUrl,
-    deadLetterUrl,
-  }));
+  console.log(
+    JSON.stringify({
+      event: "queue.configured",
+      queue: name,
+      queueUrl,
+      deadLetterUrl,
+    }),
+  );
 }
 
 try {
-  await setupQueue("wagering-transactions");
-  await setupQueue("wagering-events");
-} catch (error: unknown) {
-  console.error("Falha ao configurar filas:", error);
+  await setupQueue(
+    "wager-transactions.fifo",
+    "wager-transactions-dlq.fifo",
+    true,
+  );
+
+  await setupQueue(
+    "wagering-events",
+    "wagering-events-dlq",
+    false,
+  );
+} catch (error) {
+  console.error(
+    JSON.stringify({
+      event: "queue.setup_failed",
+      message:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    }),
+  );
+
   process.exitCode = 1;
 } finally {
   client.destroy();
