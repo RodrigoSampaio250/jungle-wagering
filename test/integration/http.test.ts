@@ -17,6 +17,33 @@ import { WagerController } from "../../src/infrastructure/http/wager.controller"
 import { WalletLedgerController } from "../../src/infrastructure/http/wallet-ledger.controller";
 import { WalletReconciliationController } from "../../src/infrastructure/http/wallet-reconciliation.controller";
 
+interface WalletResponse {
+  id: string;
+  balance: {
+    amount: string;
+    currency: string;
+  };
+  version: number;
+}
+
+interface TransactionResponse {
+  transactionId: string;
+  status: string;
+  balance: {
+    amount: string;
+    currency: string;
+  } | null;
+  failureCode: string | null;
+  idempotentReplay: boolean;
+}
+
+interface LedgerPage {
+  items: {
+    direction: string;
+  }[];
+  nextCursor: string | null;
+}
+
 @Module({})
 class HttpTestModule {}
 
@@ -69,21 +96,16 @@ beforeAll(async () => {
 
   configureHttp(app);
 
-  // Porta zero pede uma porta disponível ao sistema operacional.
   await app.listen(0, "127.0.0.1");
   baseUrl = await app.getUrl();
 }, 30_000);
 
 afterAll(async () => {
   try {
-    if (app) {
-      await app.close();
-    }
+    await app?.close();
   } finally {
     try {
-      if (orm) {
-        await orm.close(true);
-      }
+      await orm?.close(true);
     } finally {
       try {
         if (admin && databaseCreated) {
@@ -92,9 +114,7 @@ afterAll(async () => {
           );
         }
       } finally {
-        if (admin) {
-          await admin.close(true);
-        }
+        await admin?.close(true);
       }
     }
   }
@@ -117,57 +137,86 @@ function post(
   });
 }
 
+async function createFixture() {
+  const playerId = crypto.randomUUID();
+
+  const created = await post("/wallets", {
+    playerId,
+    initialBalance: {
+      amount: "100.00",
+      currency: "BRL",
+    },
+  });
+
+  expect(created.status).toBe(201);
+
+  const wallet = await created.json() as WalletResponse;
+
+  const input = {
+    providerId: "provider-http",
+    externalTransactionId: crypto.randomUUID(),
+    playerId,
+    walletId: wallet.id,
+    roundId: crypto.randomUUID(),
+    gameId: "game-http",
+    kind: "BET",
+    money: {
+      amount: "25.00",
+      currency: "BRL",
+    },
+  };
+
+  return { wallet, input };
+}
+
+async function expectReconciliation(
+  walletId: string,
+  amount: string,
+  checkedEntries: number,
+) {
+  const response = await post(
+    `/wallets/${walletId}/reconciliation`,
+    {},
+  );
+
+  expect(response.status).toBe(200);
+
+  expect(await response.json()).toEqual({
+    walletId,
+    storedBalance: {
+      amount,
+      currency: "BRL",
+    },
+    calculatedBalance: {
+      amount,
+      currency: "BRL",
+    },
+    difference: {
+      amount: "0.00",
+      currency: "BRL",
+    },
+    consistent: true,
+    checkedEntries,
+  });
+}
+
 describe("API HTTP — PostgreSQL real", () => {
-  test("cria carteira, processa aposta e consulta os resultados", async () => {
-    const playerId = crypto.randomUUID();
-
-    const created = await post("/wallets", {
-      playerId,
-      initialBalance: {
-        amount: "100.00",
-        currency: "BRL",
-      },
-    });
-
-    expect(created.status).toBe(201);
-
-    const wallet = await created.json() as {
-      id: string;
-      balance: { amount: string; currency: string };
-      version: number;
-    };
+  test("cria carteira, processa aposta e mantém as rotas anteriores", async () => {
+    const { wallet, input } = await createFixture();
 
     expect(wallet.balance.amount).toBe("100.00");
     expect(wallet.version).toBe(1);
-
-    const input = {
-      providerId: "provider-http",
-      externalTransactionId: crypto.randomUUID(),
-      playerId,
-      walletId: wallet.id,
-      roundId: "round-http",
-      gameId: "game-http",
-      kind: "BET",
-      money: {
-        amount: "25.00",
-        currency: "BRL",
-      },
-    };
 
     const key = crypto.randomUUID();
 
     const processed = await post("/transactions", input, key);
     expect(processed.status).toBe(200);
 
-    const transaction = await processed.json() as {
-      transactionId: string;
-      status: string;
-      balance: { amount: string; currency: string };
-      idempotentReplay: boolean;
-    };
+    const transaction =
+      await processed.json() as TransactionResponse;
 
     expect(transaction.status).toBe("PROCESSED");
-    expect(transaction.balance.amount).toBe("75.00");
+    expect(transaction.balance?.amount).toBe("75.00");
     expect(transaction.idempotentReplay).toBe(false);
 
     const repeated = await post("/transactions", input, key);
@@ -212,7 +261,10 @@ describe("API HTTP — PostgreSQL real", () => {
 
     expect(current.status).toBe(200);
     expect(await current.json()).toMatchObject({
-      balance: { amount: "75.00", currency: "BRL" },
+      balance: {
+        amount: "75.00",
+        currency: "BRL",
+      },
       version: 2,
     });
 
@@ -222,16 +274,15 @@ describe("API HTTP — PostgreSQL real", () => {
 
     expect(firstPage.status).toBe(200);
 
-    const first = await firstPage.json() as {
-      items: { direction: string }[];
-      nextCursor: string | null;
-    };
+    const first = await firstPage.json() as LedgerPage;
 
     expect(first.items).toHaveLength(1);
     expect(first.items[0]?.direction).toBe("CREDIT");
 
     if (typeof first.nextCursor !== "string") {
-      throw new Error("Era esperado um cursor para a segunda página.");
+      throw new Error(
+        "Era esperado um cursor para a segunda página.",
+      );
     }
 
     const secondPage = await fetch(
@@ -243,7 +294,10 @@ describe("API HTTP — PostgreSQL real", () => {
       items: [
         {
           direction: "DEBIT",
-          money: { amount: "25.00", currency: "BRL" },
+          money: {
+            amount: "25.00",
+            currency: "BRL",
+          },
           balanceBefore: "100.00",
           balanceAfter: "75.00",
         },
@@ -265,6 +319,192 @@ describe("API HTTP — PostgreSQL real", () => {
     });
   });
 
+  test("usa as rotas do enunciado e o contrato POST de reconciliação", async () => {
+    const { wallet, input } = await createFixture();
+    const key = crypto.randomUUID();
+
+    const processed = await post(
+      "/wagering/transactions",
+      input,
+      key,
+    );
+
+    expect(processed.status).toBe(200);
+
+    const transaction =
+      await processed.json() as TransactionResponse;
+
+    expect(transaction.status).toBe("PROCESSED");
+    expect(transaction.balance?.amount).toBe("75.00");
+
+    const repeated = await post(
+      "/wagering/transactions",
+      input,
+      key,
+    );
+
+    expect(repeated.status).toBe(200);
+    expect(await repeated.json()).toEqual({
+      ...transaction,
+      idempotentReplay: true,
+    });
+
+    const lookup = await fetch(
+      `${baseUrl}/wagering/transactions/${transaction.transactionId}`,
+    );
+
+    expect(lookup.status).toBe(200);
+    expect(await lookup.json()).toMatchObject({
+      transactionId: transaction.transactionId,
+      status: "PROCESSED",
+    });
+
+    const provider = encodeURIComponent(input.providerId);
+    const externalId = encodeURIComponent(
+      input.externalTransactionId,
+    );
+
+    const external = await fetch(
+      `${baseUrl}/providers/${provider}/wagering/transactions/${externalId}`,
+    );
+
+    expect(external.status).toBe(200);
+    expect(await external.json()).toMatchObject({
+      transactionId: transaction.transactionId,
+      providerId: input.providerId,
+      externalTransactionId: input.externalTransactionId,
+    });
+
+    const conflicting = await post(
+      "/wagering/transactions",
+      {
+        ...input,
+        money: {
+          amount: "30.00",
+          currency: "BRL",
+        },
+      },
+      key,
+    );
+
+    expect(conflicting.status).toBe(409);
+    expect(await conflicting.json()).toMatchObject({
+      code: "IDEMPOTENCY_CONFLICT",
+    });
+
+    await expectReconciliation(wallet.id, "75.00", 2);
+  });
+
+  test("rejeição de negócio retorna 422 e replay não movimenta saldo", async () => {
+    const { wallet, input } = await createFixture();
+    const key = crypto.randomUUID();
+
+    const insufficient = {
+      ...input,
+      money: {
+        amount: "150.00",
+        currency: "BRL",
+      },
+    };
+
+    const rejected = await post(
+      "/wagering/transactions",
+      insufficient,
+      key,
+    );
+
+    expect(rejected.status).toBe(422);
+
+    const transaction =
+      await rejected.json() as TransactionResponse;
+
+    expect(transaction.status).toBe("REJECTED");
+    expect(transaction.failureCode).toBe(
+      "INSUFFICIENT_BALANCE",
+    );
+    expect(transaction.balance?.amount).toBe("100.00");
+    expect(transaction.idempotentReplay).toBe(false);
+
+    const repeated = await post(
+      "/wagering/transactions",
+      insufficient,
+      key,
+    );
+
+    expect(repeated.status).toBe(422);
+    expect(await repeated.json()).toEqual({
+      ...transaction,
+      idempotentReplay: true,
+    });
+
+    const current = await fetch(
+      `${baseUrl}/wallets/${wallet.id}`,
+    );
+
+    expect(current.status).toBe(200);
+    expect(await current.json()).toMatchObject({
+      balance: {
+        amount: "100.00",
+        currency: "BRL",
+      },
+      version: 1,
+    });
+
+    await expectReconciliation(wallet.id, "100.00", 1);
+  });
+
+  test("referência ausente retorna 202 e preserva a operação pendente", async () => {
+    const { wallet, input } = await createFixture();
+    const key = crypto.randomUUID();
+
+    const refund = {
+      ...input,
+      kind: "REFUND",
+      referenceExternalTransactionId: crypto.randomUUID(),
+    };
+
+    const pending = await post(
+      "/wagering/transactions",
+      refund,
+      key,
+    );
+
+    expect(pending.status).toBe(202);
+
+    const transaction =
+      await pending.json() as TransactionResponse;
+
+    expect(transaction.status).toBe("PENDING_REFERENCE");
+    expect(transaction.failureCode).toBeNull();
+    expect(transaction.balance?.amount).toBe("100.00");
+    expect(transaction.idempotentReplay).toBe(false);
+
+    const repeated = await post(
+      "/wagering/transactions",
+      refund,
+      key,
+    );
+
+    expect(repeated.status).toBe(202);
+    expect(await repeated.json()).toEqual({
+      ...transaction,
+      idempotentReplay: true,
+    });
+
+    const lookup = await fetch(
+      `${baseUrl}/wagering/transactions/${transaction.transactionId}`,
+    );
+
+    expect(lookup.status).toBe(200);
+    expect(await lookup.json()).toMatchObject({
+      status: "PENDING_REFERENCE",
+      referenceExternalTransactionId:
+        refund.referenceExternalTransactionId,
+    });
+
+    await expectReconciliation(wallet.id, "100.00", 1);
+  });
+
   test("rejeita dinheiro numérico e não cria a carteira", async () => {
     const playerId = crypto.randomUUID();
 
@@ -278,7 +518,6 @@ describe("API HTTP — PostgreSQL real", () => {
 
     expect(invalid.status).toBe(400);
 
-    // A tentativa inválida não deve reservar jogador e moeda.
     const valid = await post("/wallets", {
       playerId,
       initialBalance: {
@@ -292,7 +531,7 @@ describe("API HTTP — PostgreSQL real", () => {
 
   test("retorna 404 para uma transação inexistente", async () => {
     const response = await fetch(
-      `${baseUrl}/transactions/${crypto.randomUUID()}`,
+      `${baseUrl}/wagering/transactions/${crypto.randomUUID()}`,
     );
 
     expect(response.status).toBe(404);
@@ -302,7 +541,9 @@ describe("API HTTP — PostgreSQL real", () => {
   });
 
   test("readiness verifica o banco", async () => {
-    const response = await fetch(`${baseUrl}/health/ready`);
+    const response = await fetch(
+      `${baseUrl}/health/ready`,
+    );
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({

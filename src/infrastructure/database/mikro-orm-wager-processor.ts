@@ -241,7 +241,7 @@ export class MikroOrmWagerProcessor implements WagerProcessor {
               }
 
               if (transaction.kind === Kind.Rollback) {
-                transaction.fail(
+                transaction.reject(
                   FailureCode.ReversalInsufficientBalance,
                 );
               } else {

@@ -447,7 +447,7 @@ describe("ProcessWager — PostgreSQL real", () => {
     });
   });
 
-  test("ROLLBACK sem saldo falha com código específico e sem ledger", async () => {
+  test("ROLLBACK sem saldo é rejeitado com código específico e sem ledger", async () => {
     const wallet = await openWallet();
     const winInput = {
       ...bet(wallet),
@@ -468,7 +468,7 @@ describe("ProcessWager — PostgreSQL real", () => {
         winInput.externalTransactionId,
     });
 
-    expect(result.status).toBe(Status.Failed);
+    expect(result.status).toBe(Status.Rejected);
     expect(result.failureCode).toBe(
       FailureCode.ReversalInsufficientBalance,
     );

@@ -1,10 +1,12 @@
 import {
   Controller,
   Get,
+  HttpCode,
   Inject,
   NotFoundException,
   Param,
   ParseUUIDPipe,
+  Post,
 } from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/postgresql";
 
@@ -25,10 +27,59 @@ export class WalletReconciliationController {
     private readonly orm: MikroORM,
   ) {}
 
-  @Get(":id/reconciliation")
+  @Post(":id/reconciliation")
+  @HttpCode(200)
   async reconcile(
     @Param("id", new ParseUUIDPipe()) walletId: string,
   ) {
+    const row = await this.calculate(walletId);
+    const checkedEntries = Number(row.entry_count);
+
+    if (!Number.isSafeInteger(checkedEntries)) {
+      throw new Error(
+        "Quantidade de lançamentos fora do intervalo suportado.",
+      );
+    }
+
+    return {
+      walletId: row.id,
+      storedBalance: {
+        amount: row.balance,
+        currency: row.currency,
+      },
+      calculatedBalance: {
+        amount: row.ledger_balance,
+        currency: row.currency,
+      },
+      difference: {
+        amount: row.difference,
+        currency: row.currency,
+      },
+      consistent: row.consistent,
+      checkedEntries,
+    };
+  }
+
+  @Get(":id/reconciliation")
+  async reconcileLegacy(
+    @Param("id", new ParseUUIDPipe()) walletId: string,
+  ) {
+    const row = await this.calculate(walletId);
+
+    return {
+      walletId: row.id,
+      currency: row.currency,
+      storedBalance: row.balance,
+      ledgerBalance: row.ledger_balance,
+      difference: row.difference,
+      consistent: row.consistent,
+      entryCount: row.entry_count,
+    };
+  }
+
+  private async calculate(
+    walletId: string,
+  ): Promise<ReconciliationRow> {
     const rows = await this.orm.em.fork().execute<
       ReconciliationRow[]
     >(
@@ -65,14 +116,15 @@ export class WalletReconciliationController {
       });
     }
 
-    return {
-      walletId: row.id,
-      currency: row.currency,
-      storedBalance: row.balance,
-      ledgerBalance: row.ledger_balance,
-      difference: row.difference,
-      consistent: row.consistent,
-      entryCount: row.entry_count,
-    };
+    if (!row.consistent) {
+      console.error(
+        JSON.stringify({
+          event: "wallet.reconciliation.mismatch",
+          walletId: row.id,
+        }),
+      );
+    }
+
+    return row;
   }
 }
