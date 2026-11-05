@@ -16,6 +16,8 @@ import { WalletController } from "../../src/infrastructure/http/wallet.controlle
 import { WagerController } from "../../src/infrastructure/http/wager.controller";
 import { WalletLedgerController } from "../../src/infrastructure/http/wallet-ledger.controller";
 import { WalletReconciliationController } from "../../src/infrastructure/http/wallet-reconciliation.controller";
+import { APP_GUARD } from "@nestjs/core";
+import { ProviderAuthGuard } from "../../src/infrastructure/http/provider-auth.guard";
 
 interface WalletResponse {
   id: string;
@@ -85,10 +87,14 @@ beforeAll(async () => {
         WalletReconciliationController,
       ],
       providers: [
-        {
-          provide: MikroORM,
-          useValue: orm,
-        },
+            {
+              provide: MikroORM,
+              useValue: orm,
+            },
+            {
+              provide: APP_GUARD,
+              useClass: ProviderAuthGuard,
+            },
       ],
     },
     { logger: false },

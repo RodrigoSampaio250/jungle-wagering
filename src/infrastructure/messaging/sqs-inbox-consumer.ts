@@ -18,6 +18,10 @@ import {
   messageFailures,
   messageRedeliveries,
 } from "../observability/metrics";
+import {
+  scheduleMessageRetry,
+  type MessageFailurePhase,
+} from "./message-retry";
 
 export interface InboxEnvelope<T> {
   readonly messageId: string;
@@ -28,7 +32,6 @@ export interface InboxEnvelope<T> {
 export type ConsumeResult = InboxExecutionResult | "empty";
 
 type AfterCommit = () => void;
-type FailurePhase = "decode" | "process" | "ack";
 
 function businessIdentifiers(
   payload: unknown,
@@ -126,6 +129,15 @@ export class SqsInboxConsumer<T> {
 
           envelope = this.decode(message.Body);
         } catch (error: unknown) {
+          await scheduleMessageRetry(
+            this.client,
+            this.queueUrl,
+            message.ReceiptHandle,
+            receiveCount,
+            "decode",
+            error,
+          );
+
           this.logFailure(
             error,
             "decode",
@@ -147,7 +159,8 @@ export class SqsInboxConsumer<T> {
             ...businessIdentifiers(envelope.payload),
           },
           async (): Promise<ConsumeResult> => {
-            let phase: FailurePhase = "process";
+            let phase: MessageFailurePhase = "process";
+
             const observation: {
               afterCommit?: AfterCommit;
             } = {};
@@ -169,10 +182,11 @@ export class SqsInboxConsumer<T> {
                 },
               );
 
+              // O commit externo do inbox já terminou.
               inboxResults.inc({ result });
 
-              // Somente observabilidade: nunca colocar
-              // efeitos financeiros nesta função.
+              // Apenas observabilidade. Uma falha aqui
+              // não deve provocar retry financeiro.
               if (observation.afterCommit !== undefined) {
                 try {
                   observation.afterCommit();
@@ -213,6 +227,15 @@ export class SqsInboxConsumer<T> {
 
               return result;
             } catch (error: unknown) {
+              await scheduleMessageRetry(
+                this.client,
+                this.queueUrl,
+                receiptHandle,
+                receiveCount,
+                phase,
+                error,
+              );
+
               this.logFailure(
                 error,
                 phase,
@@ -230,7 +253,7 @@ export class SqsInboxConsumer<T> {
 
   private logFailure(
     error: unknown,
-    phase: FailurePhase,
+    phase: MessageFailurePhase,
     receiveCount: number,
     startedAt: number,
   ): void {
