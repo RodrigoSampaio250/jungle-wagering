@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { HealthController } from "./health.controller";
 import { DatabaseModule } from "./infrastructure/database/database.module";
+import { MetricsController } from "./infrastructure/http/metrics.controller";
 import { WalletController } from "./infrastructure/http/wallet.controller";
 import { WagerController } from "./infrastructure/http/wager.controller";
 import { WalletLedgerController } from "./infrastructure/http/wallet-ledger.controller";
@@ -10,6 +11,7 @@ import { WalletReconciliationController } from "./infrastructure/http/wallet-rec
   imports: [DatabaseModule],
   controllers: [
     HealthController,
+    MetricsController,
     WalletController,
     WagerController,
     WalletLedgerController,

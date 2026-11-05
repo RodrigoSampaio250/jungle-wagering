@@ -8,6 +8,16 @@ import {
   InboxExecutor,
   type InboxExecutionResult,
 } from "../database/inbox-executor";
+import {
+  correlationIdFrom,
+  logger,
+  runWithContext,
+} from "../observability/execution-context";
+import {
+  inboxResults,
+  messageFailures,
+  messageRedeliveries,
+} from "../observability/metrics";
 
 export interface InboxEnvelope<T> {
   readonly messageId: string;
@@ -16,6 +26,35 @@ export interface InboxEnvelope<T> {
 }
 
 export type ConsumeResult = InboxExecutionResult | "empty";
+
+type AfterCommit = () => void;
+type FailurePhase = "decode" | "process" | "ack";
+
+function businessIdentifiers(
+  payload: unknown,
+): {
+  walletId?: string;
+  providerId?: string;
+} {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
+    return {};
+  }
+
+  const data = payload as Record<string, unknown>;
+
+  return {
+    ...(typeof data.walletId === "string"
+      ? { walletId: data.walletId }
+      : {}),
+    ...(typeof data.providerId === "string"
+      ? { providerId: data.providerId }
+      : {}),
+  };
+}
 
 export class SqsInboxConsumer<T> {
   constructor(
@@ -27,7 +66,7 @@ export class SqsInboxConsumer<T> {
     private readonly handler: (
       em: EntityManager,
       payload: T,
-    ) => Promise<void>,
+    ) => Promise<void | AfterCommit>,
   ) {}
 
   async consumeOne(
@@ -39,44 +78,176 @@ export class SqsInboxConsumer<T> {
         MaxNumberOfMessages: 1,
         WaitTimeSeconds: waitTimeSeconds,
         VisibilityTimeout: 60,
+        MessageSystemAttributeNames: [
+          "ApproximateReceiveCount",
+        ],
       }),
     );
 
     const message = response.Messages?.[0];
 
-    if (!message) {
+    if (message === undefined) {
       return "empty";
     }
 
-    if (
-      message.Body === undefined ||
-      !message.ReceiptHandle
-    ) {
-      throw new Error(
-        "SQS retornou mensagem sem corpo ou receipt handle.",
-      );
+    const parsedCount = Number(
+      message.Attributes?.ApproximateReceiveCount ?? "1",
+    );
+
+    const receiveCount =
+      Number.isSafeInteger(parsedCount) && parsedCount > 0
+        ? parsedCount
+        : 1;
+
+    if (receiveCount > 1) {
+      messageRedeliveries.inc();
     }
 
-    const envelope = this.decode(message.Body);
+    return runWithContext(
+      {
+        correlationId: correlationIdFrom(message.MessageId),
+        ...(message.MessageId !== undefined
+          ? { messageId: message.MessageId }
+          : {}),
+      },
+      async (): Promise<ConsumeResult> => {
+        const startedAt = performance.now();
+        let envelope: InboxEnvelope<T>;
 
-    const result = await this.inbox.execute(
-      this.consumerName,
-      envelope.messageId,
-      envelope.payloadHash,
-      async (em) => {
-        await this.handler(em, envelope.payload);
+        try {
+          if (
+            message.Body === undefined ||
+            !message.ReceiptHandle
+          ) {
+            throw new Error(
+              "SQS retornou mensagem sem corpo ou receipt handle.",
+            );
+          }
+
+          envelope = this.decode(message.Body);
+        } catch (error: unknown) {
+          this.logFailure(
+            error,
+            "decode",
+            receiveCount,
+            startedAt,
+          );
+
+          throw error;
+        }
+
+        const receiptHandle = message.ReceiptHandle;
+
+        return runWithContext(
+          {
+            correlationId: correlationIdFrom(
+              envelope.messageId,
+            ),
+            messageId: envelope.messageId,
+            ...businessIdentifiers(envelope.payload),
+          },
+          async (): Promise<ConsumeResult> => {
+            let phase: FailurePhase = "process";
+            const observation: {
+              afterCommit?: AfterCommit;
+            } = {};
+
+            try {
+              const result = await this.inbox.execute(
+                this.consumerName,
+                envelope.messageId,
+                envelope.payloadHash,
+                async (em) => {
+                  const callback = await this.handler(
+                    em,
+                    envelope.payload,
+                  );
+
+                  if (typeof callback === "function") {
+                    observation.afterCommit = callback;
+                  }
+                },
+              );
+
+              inboxResults.inc({ result });
+
+              // Somente observabilidade: nunca colocar
+              // efeitos financeiros nesta função.
+              if (observation.afterCommit !== undefined) {
+                try {
+                  observation.afterCommit();
+                } catch (error: unknown) {
+                  logger.error("inbox.observation.failed", {
+                    errorType:
+                      error instanceof Error
+                        ? error.name
+                        : "UnknownError",
+                  });
+                }
+              }
+
+              logger.info("inbox.execution.committed", {
+                consumer: this.consumerName,
+                result,
+                receiveCount,
+              });
+
+              phase = "ack";
+
+              await this.client.send(
+                new DeleteMessageCommand({
+                  QueueUrl: this.queueUrl,
+                  ReceiptHandle: receiptHandle,
+                }),
+              );
+
+              logger.info("sqs.message.acknowledged", {
+                consumer: this.consumerName,
+                result,
+                receiveCount,
+                durationMs:
+                  Math.round(
+                    (performance.now() - startedAt) * 100,
+                  ) / 100,
+              });
+
+              return result;
+            } catch (error: unknown) {
+              this.logFailure(
+                error,
+                phase,
+                receiveCount,
+                startedAt,
+              );
+
+              throw error;
+            }
+          },
+        );
       },
     );
+  }
 
-    // execute() só termina com sucesso depois do commit.
-    // Duplicatas já confirmadas também podem ser excluídas.
-    await this.client.send(
-      new DeleteMessageCommand({
-        QueueUrl: this.queueUrl,
-        ReceiptHandle: message.ReceiptHandle,
-      }),
-    );
+  private logFailure(
+    error: unknown,
+    phase: FailurePhase,
+    receiveCount: number,
+    startedAt: number,
+  ): void {
+    messageFailures.inc({ phase });
 
-    return result;
+    logger.error("sqs.message.failed", {
+      consumer: this.consumerName,
+      phase,
+      receiveCount,
+      errorType:
+        error instanceof Error
+          ? error.name
+          : "UnknownError",
+      durationMs:
+        Math.round(
+          (performance.now() - startedAt) * 100,
+        ) / 100,
+    });
   }
 }

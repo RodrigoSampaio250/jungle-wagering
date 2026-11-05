@@ -9,6 +9,13 @@ import {
   Post,
 } from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/postgresql";
+import {
+  enrichContext,
+  logger,
+} from "../observability/execution-context";
+import {
+  reconciliationMismatches,
+} from "../observability/metrics";
 
 interface ReconciliationRow {
   id: string;
@@ -35,7 +42,10 @@ export class WalletReconciliationController {
     const row = await this.calculate(walletId);
     const checkedEntries = Number(row.entry_count);
 
-    if (!Number.isSafeInteger(checkedEntries)) {
+    if (
+      !Number.isSafeInteger(checkedEntries) ||
+      checkedEntries < 0
+    ) {
       throw new Error(
         "Quantidade de lançamentos fora do intervalo suportado.",
       );
@@ -80,6 +90,8 @@ export class WalletReconciliationController {
   private async calculate(
     walletId: string,
   ): Promise<ReconciliationRow> {
+    enrichContext({ walletId });
+
     const rows = await this.orm.em.fork().execute<
       ReconciliationRow[]
     >(
@@ -109,7 +121,7 @@ export class WalletReconciliationController {
 
     const row = rows[0];
 
-    if (!row) {
+    if (row === undefined) {
       throw new NotFoundException({
         code: "WALLET_NOT_FOUND",
         message: "Carteira não encontrada.",
@@ -117,12 +129,15 @@ export class WalletReconciliationController {
     }
 
     if (!row.consistent) {
-      console.error(
-        JSON.stringify({
-          event: "wallet.reconciliation.mismatch",
-          walletId: row.id,
-        }),
-      );
+      reconciliationMismatches.inc();
+
+      logger.error("wallet.reconciliation.mismatch", {
+        walletId: row.id,
+      });
+    } else {
+      logger.info("wallet.reconciliation.consistent", {
+        walletId: row.id,
+      });
     }
 
     return row;

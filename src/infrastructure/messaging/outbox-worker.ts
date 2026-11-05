@@ -5,14 +5,19 @@ import {
 import { MikroORM } from "@mikro-orm/postgresql";
 import config from "../database/mikro-orm.config";
 import { OutboxPublisher } from "../database/outbox-publisher";
+import { logger } from "../observability/execution-context";
+import {
+  startMetricsServer,
+  type MetricsServer,
+} from "../observability/metrics-server";
 import { SqsEventPublisher } from "./sqs-event-publisher";
 
 const client = new SQSClient({
   endpoint: process.env.SQS_ENDPOINT ?? "http://127.0.0.1:4566",
   region: process.env.AWS_REGION ?? "us-east-1",
   credentials: {
-    accessKeyId: "test",
-    secretAccessKey: "test",
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? "test",
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? "test",
   },
   maxAttempts: 3,
   requestHandler: {
@@ -22,6 +27,7 @@ const client = new SQSClient({
 });
 
 let orm: MikroORM | undefined;
+let metricsServer: MetricsServer | undefined;
 let stopping = false;
 let wakeUp: (() => void) | undefined;
 
@@ -33,9 +39,7 @@ function requestStop(): void {
   stopping = true;
   wakeUp?.();
 
-  console.log(JSON.stringify({
-    event: "outbox.worker.stopping",
-  }));
+  logger.info("outbox.worker.stopping");
 }
 
 function pause(milliseconds: number): Promise<void> {
@@ -59,6 +63,8 @@ process.on("SIGINT", requestStop);
 process.on("SIGTERM", requestStop);
 
 try {
+  metricsServer = await startMetricsServer();
+
   const queue = await client.send(
     new GetQueueUrlCommand({
       QueueName: "wagering-events",
@@ -76,9 +82,7 @@ try {
     new SqsEventPublisher(client, queue.QueueUrl),
   );
 
-  console.log(JSON.stringify({
-    event: "outbox.worker.started",
-  }));
+  logger.info("outbox.worker.started");
 
   while (!stopping) {
     try {
@@ -87,49 +91,44 @@ try {
       if (result === "empty") {
         await pause(1_000);
       } else {
-        console.log(JSON.stringify({
-          event: "outbox.publish",
-          result,
-        }));
+        logger.info("outbox.worker.result", { result });
 
         if (result === "retry") {
           await pause(500);
         }
       }
     } catch (error: unknown) {
-      console.error(JSON.stringify({
-        event: "outbox.worker.error",
-        message:
+      logger.error("outbox.worker.error", {
+        errorType:
           error instanceof Error
-            ? error.message
-            : "Falha desconhecida.",
-      }));
+            ? error.name
+            : "UnknownError",
+      });
 
       await pause(2_000);
     }
   }
 } catch (error: unknown) {
-  console.error(JSON.stringify({
-    event: "outbox.worker.start_failed",
-    message:
+  logger.error("outbox.worker.start_failed", {
+    errorType:
       error instanceof Error
-        ? error.message
-        : "Falha desconhecida.",
-  }));
+        ? error.name
+        : "UnknownError",
+  });
 
   process.exitCode = 1;
 } finally {
   try {
-    if (orm) {
-      await orm.close(true);
-    }
+    await metricsServer?.stop();
   } finally {
-    client.destroy();
-    process.off("SIGINT", requestStop);
-    process.off("SIGTERM", requestStop);
-  }
+    try {
+      await orm?.close(true);
+    } finally {
+      client.destroy();
+      process.off("SIGINT", requestStop);
+      process.off("SIGTERM", requestStop);
 
-  console.log(JSON.stringify({
-    event: "outbox.worker.stopped",
-  }));
+      logger.info("outbox.worker.stopped");
+    }
+  }
 }

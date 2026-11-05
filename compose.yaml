@@ -1,16 +1,19 @@
+x-environment: &environment
+  NODE_ENV: production
+  DATABASE_URL: postgres://wagering:wagering_local@postgres:5432/wagering
+  SQS_ENDPOINT: http://localstack:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  REFERENCE_TTL_MS: "3600000"
+  METRICS_PORT: "9100"
+
 x-app: &app
   image: jungle-wagering:local
   build:
     context: .
   init: true
-  environment:
-    NODE_ENV: production
-    DATABASE_URL: postgres://wagering:wagering_local@postgres:5432/wagering
-    SQS_ENDPOINT: http://localstack:4566
-    AWS_REGION: us-east-1
-    AWS_ACCESS_KEY_ID: test
-    AWS_SECRET_ACCESS_KEY: test
-    REFERENCE_TTL_MS: "3600000"
+  environment: *environment
   stop_grace_period: 60s
   restart: unless-stopped
 
@@ -107,38 +110,62 @@ services:
 
   api-1:
     <<: *api
+    environment:
+      <<: *environment
+      SERVICE_NAME: api-1
     ports:
       - "127.0.0.1:3001:3000"
 
   api-2:
     <<: *api
+    environment:
+      <<: *environment
+      SERVICE_NAME: api-2
     ports:
       - "127.0.0.1:3002:3000"
 
   api-3:
     <<: *api
+    environment:
+      <<: *environment
+      SERVICE_NAME: api-3
     ports:
       - "127.0.0.1:3003:3000"
 
   wager-worker:
     <<: *app
+    environment:
+      <<: *environment
+      SERVICE_NAME: wager-worker
     command:
       - bun
       - src/infrastructure/messaging/wager-worker.ts
+    ports:
+      - "127.0.0.1:9101:9100"
     depends_on: *ready
 
   outbox-worker:
     <<: *app
+    environment:
+      <<: *environment
+      SERVICE_NAME: outbox-worker
     command:
       - bun
       - src/infrastructure/messaging/outbox-worker.ts
+    ports:
+      - "127.0.0.1:9102:9100"
     depends_on: *ready
 
   reference-worker:
     <<: *app
+    environment:
+      <<: *environment
+      SERVICE_NAME: reference-worker
     command:
       - bun
       - src/infrastructure/messaging/reference-worker.ts
+    ports:
+      - "127.0.0.1:9103:9100"
     depends_on: *ready
 
 volumes:

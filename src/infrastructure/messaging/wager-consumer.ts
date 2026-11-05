@@ -13,6 +13,14 @@ import {
   SqsInboxConsumer,
   type InboxEnvelope,
 } from "./sqs-inbox-consumer";
+import {
+  enrichContext,
+  logger,
+} from "../observability/execution-context";
+import {
+  transactionDuration,
+  transactionResults,
+} from "../observability/metrics";
 
 function objectValue(
   value: unknown,
@@ -163,9 +171,34 @@ export function createWagerConsumer(
     new InboxExecutor(orm),
     decodeWagerMessage,
     async (em, payload) => {
+      const startedAt = performance.now();
       const processor = new MikroOrmWagerProcessor(orm, em);
 
-      await new SubmitWager(processor).execute(payload);
+      const result = await new SubmitWager(processor)
+        .execute(payload);
+
+      enrichContext({
+        transactionId: result.transactionId,
+      });
+
+      // O consumidor chama esta função depois do commit.
+      return () => {
+        transactionResults.inc({
+          status: result.status,
+          replay: String(result.idempotentReplay),
+        });
+
+        transactionDuration.observe(
+          (performance.now() - startedAt) / 1_000,
+        );
+
+        logger.info("transaction.sqs.committed", {
+          transactionId: result.transactionId,
+          status: result.status,
+          idempotentReplay: result.idempotentReplay,
+          failureCode: result.failureCode,
+        });
+      };
     },
   );
 }

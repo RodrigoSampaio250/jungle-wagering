@@ -29,6 +29,15 @@ import {
 } from "../../domain/wager-transaction.types";
 import { MikroOrmWagerProcessor } from "../database/mikro-orm-wager-processor";
 import { WagerTransactionRecord } from "../database/wager-transaction.record";
+import {
+  enrichContext,
+  logger,
+} from "../observability/execution-context";
+import {
+  lockConflicts,
+  transactionDuration,
+  transactionResults,
+} from "../observability/metrics";
 import { SubmitWagerDto } from "./dto/submit-wager.dto";
 
 interface HttpResponse {
@@ -60,7 +69,15 @@ const transientCodes = new Set([
   "57P03",
 ]);
 
-function isTransientInfrastructureError(error: unknown): boolean {
+const lockConflictCodes = new Set([
+  "40P01",
+  "55P03",
+]);
+
+function hasErrorCode(
+  error: unknown,
+  codes: ReadonlySet<string>,
+): boolean {
   let current: unknown = error;
 
   for (let depth = 0; depth < 5; depth += 1) {
@@ -72,7 +89,7 @@ function isTransientInfrastructureError(error: unknown): boolean {
 
     if (
       typeof details.code === "string" &&
-      transientCodes.has(details.code)
+      codes.has(details.code)
     ) {
       return true;
     }
@@ -135,7 +152,7 @@ export class WagerController {
       { id },
     );
 
-    if (!transaction) {
+    if (transaction === null) {
       throw new NotFoundException({
         code: "TRANSACTION_NOT_FOUND",
         message: "Transação não encontrada.",
@@ -167,6 +184,13 @@ export class WagerController {
       });
     }
 
+    enrichContext({
+      walletId: body.walletId,
+      providerId: body.providerId,
+    });
+
+    const startedAt = performance.now();
+
     try {
       const result = await this.submitWager.execute({
         providerId: body.providerId,
@@ -184,6 +208,21 @@ export class WagerController {
                 body.referenceExternalTransactionId,
             }
           : {}),
+      });
+
+      enrichContext({
+        transactionId: result.transactionId,
+      });
+
+      transactionResults.inc({
+        status: result.status,
+        replay: String(result.idempotentReplay),
+      });
+
+      logger.info("transaction.http.committed", {
+        status: result.status,
+        idempotentReplay: result.idempotentReplay,
+        failureCode: result.failureCode,
       });
 
       switch (result.status) {
@@ -206,7 +245,24 @@ export class WagerController {
       }
 
       return result;
-    } catch (error) {
+    } catch (error: unknown) {
+      const lockConflict = hasErrorCode(
+        error,
+        lockConflictCodes,
+      );
+
+      if (lockConflict) {
+        lockConflicts.inc();
+      }
+
+      logger.warn("transaction.http.failed", {
+        errorType:
+          error instanceof Error
+            ? error.name
+            : "UnknownError",
+        lockConflict,
+      });
+
       if (error instanceof IdempotencyConflictError) {
         throw new ConflictException({
           code: "IDEMPOTENCY_CONFLICT",
@@ -231,7 +287,7 @@ export class WagerController {
         });
       }
 
-      if (isTransientInfrastructureError(error)) {
+      if (hasErrorCode(error, transientCodes)) {
         throw new ServiceUnavailableException({
           code: "INFRASTRUCTURE_UNAVAILABLE",
           message:
@@ -240,6 +296,10 @@ export class WagerController {
       }
 
       throw error;
+    } finally {
+      transactionDuration.observe(
+        (performance.now() - startedAt) / 1_000,
+      );
     }
   }
 
@@ -270,7 +330,7 @@ export class WagerController {
       },
     );
 
-    if (!transaction) {
+    if (transaction === null) {
       throw new NotFoundException({
         code: "TRANSACTION_NOT_FOUND",
         message: "Transação não encontrada.",

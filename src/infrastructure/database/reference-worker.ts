@@ -4,6 +4,11 @@ import {
   FailureCode,
   WagerTransactionStatus as Status,
 } from "../../domain/wager-transaction.types";
+import {
+  logger,
+  runWithContext,
+} from "../observability/execution-context";
+import { referenceResults } from "../observability/metrics";
 import { MikroOrmWagerProcessor } from "./mikro-orm-wager-processor";
 import { OutboxEventRecord } from "./outbox-event.record";
 import { transactionOutboxEvent } from "./transaction-outbox-event";
@@ -21,6 +26,12 @@ export type ReferenceWorkResult =
   | "failed"
   | "expired";
 
+interface ReferenceDetails {
+  transactionId: string;
+  walletId: string;
+  providerId: string;
+}
+
 export class ReferenceWorker {
   constructor(
     private readonly orm: MikroORM,
@@ -34,92 +45,144 @@ export class ReferenceWorker {
   }
 
   async processOne(): Promise<ReferenceWorkResult> {
-    return this.orm.em.fork().transactional(async (em) => {
-      const now = new Date();
-      const expirationCutoff = new Date(
-        now.getTime() - this.ttlMs,
-      );
+    const startedAt = performance.now();
+    let details: ReferenceDetails | undefined;
 
-      const record = await em.findOne(
-        WagerTransactionRecord,
-        {
-          status: Status.PendingReference,
-          $or: [
-            { nextReferenceAttemptAt: { $lte: now } },
-            { nextReferenceAttemptAt: null },
-            { createdAt: { $lte: expirationCutoff } },
-          ],
-        },
-        {
-          orderBy: {
-            createdAt: "asc",
-            id: "asc",
-          },
-          lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
-        },
-      );
-
-      if (!record) {
-        return "empty";
-      }
-
-      if (record.createdAt.getTime() <= expirationCutoff.getTime()) {
-        const transaction = transactionFromRecord(record);
-
-        transaction.reject(FailureCode.ReferenceExpired);
-
-        const expired = transactionToRecord(
-          transaction,
-          record.resultBalance,
+    const result = await this.orm.em.fork()
+      .transactional<ReferenceWorkResult>(async (em) => {
+        const now = new Date();
+        const expirationCutoff = new Date(
+          now.getTime() - this.ttlMs,
         );
 
-        await em.nativeUpdate(
+        const record = await em.findOne(
           WagerTransactionRecord,
-          { id: record.id },
           {
-            status: expired.status,
-            failureCode: expired.failureCode,
-            nextReferenceAttemptAt: null,
-            processedAt: expired.processedAt,
+            status: Status.PendingReference,
+            $or: [
+              { nextReferenceAttemptAt: { $lte: now } },
+              { nextReferenceAttemptAt: null },
+              { createdAt: { $lte: expirationCutoff } },
+            ],
+          },
+          {
+            orderBy: {
+              createdAt: "asc",
+              id: "asc",
+            },
+            lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
           },
         );
 
-        const event = transactionOutboxEvent(expired);
-
-        if (!event) {
-          throw new Error(
-            "A expiração deve gerar um evento terminal.",
-          );
+        if (record === null) {
+          return "empty";
         }
 
-        await em.insert(OutboxEventRecord, event);
+        details = {
+          transactionId: record.id,
+          walletId: record.walletId,
+          providerId: record.providerId,
+        };
 
-        return "expired";
-      }
+        if (
+          record.createdAt.getTime() <=
+          expirationCutoff.getTime()
+        ) {
+          const transaction = transactionFromRecord(record);
 
-      const result = await new MikroOrmWagerProcessor(
-        this.orm,
-        em,
-      ).retryPendingReference(record);
+          transaction.reject(FailureCode.ReferenceExpired);
 
-      switch (result.status) {
-        case Status.PendingReference:
-          return "retry";
-
-        case Status.Processed:
-          return "processed";
-
-        case Status.Rejected:
-          return "rejected";
-
-        case Status.Failed:
-          return "failed";
-
-        default:
-          throw new Error(
-            `Status inesperado após retomada: ${result.status}.`,
+          const expired = transactionToRecord(
+            transaction,
+            record.resultBalance,
           );
-      }
-    });
+
+          await em.nativeUpdate(
+            WagerTransactionRecord,
+            { id: record.id },
+            {
+              status: expired.status,
+              failureCode: expired.failureCode,
+              nextReferenceAttemptAt: null,
+              processedAt: expired.processedAt,
+            },
+          );
+
+          const event = transactionOutboxEvent(expired);
+
+          if (event === undefined) {
+            throw new Error(
+              "A expiração deve gerar um evento terminal.",
+            );
+          }
+
+          await em.insert(OutboxEventRecord, event);
+
+          return "expired";
+        }
+
+        const processing = await new MikroOrmWagerProcessor(
+          this.orm,
+          em,
+        ).retryPendingReference(record);
+
+        switch (processing.status) {
+          case Status.PendingReference:
+            return "retry";
+
+          case Status.Processed:
+            return "processed";
+
+          case Status.Rejected:
+            return "rejected";
+
+          case Status.Failed:
+            return "failed";
+
+          default:
+            throw new Error(
+              `Status inesperado após retomada: ${processing.status}.`,
+            );
+        }
+      });
+
+    // Registra apenas resultados confirmados no PostgreSQL.
+    if (result === "empty" || details === undefined) {
+      return result;
+    }
+
+    referenceResults.inc({ result });
+
+    const reference = details;
+
+    runWithContext(
+      {
+        correlationId: reference.transactionId,
+        transactionId: reference.transactionId,
+        walletId: reference.walletId,
+        providerId: reference.providerId,
+      },
+      () => {
+        const fields = {
+          result,
+          durationMs:
+            Math.round(
+              (performance.now() - startedAt) * 100,
+            ) / 100,
+        };
+
+        if (
+          result === "expired" ||
+          result === "rejected" ||
+          result === "failed"
+        ) {
+          logger.warn("reference.execution.committed", fields);
+        } else {
+          logger.info("reference.execution.committed", fields);
+        }
+      },
+    );
+
+    return result;
   }
 }

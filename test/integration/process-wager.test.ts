@@ -483,17 +483,27 @@ describe("ProcessWager — PostgreSQL real", () => {
     });
   });
 
-  test("LOSS de valor zero não altera saldo nem versão e não gera ledger", async () => {
+  test("LOSS não altera saldo nem versão e gera apenas evento de processamento", async () => {
     const wallet = await openWallet();
 
-    const result = await submit().execute({
+    const input = {
       ...bet(wallet),
       kind: Kind.Loss,
-      money: { amount: "0.00", currency: "BRL" },
-    });
+      money: {
+        amount: "0.00",
+        currency: "BRL",
+      },
+    };
+
+    const result = await submit().execute(input);
 
     expect(result.status).toBe(Status.Processed);
     expect(result.balance?.amount).toBe("100.00");
+
+    const replay = await submit().execute(input);
+
+    expect(replay.transactionId).toBe(result.transactionId);
+    expect(replay.idempotentReplay).toBe(true);
 
     expect(await state(wallet.id)).toEqual({
       balance: "100.00",
@@ -501,6 +511,38 @@ describe("ProcessWager — PostgreSQL real", () => {
       entries: "1",
       wagers: "1",
       ledger_balance: "100.00",
+    });
+
+    const events = await database().em.fork().find(
+      OutboxEventRecord,
+      { aggregateId: result.transactionId },
+    );
+
+    expect(
+      events.map((event) => event.eventType),
+    ).toEqual([
+      "WagerTransactionProcessed",
+    ]);
+
+    expect(events[0]?.payload).toMatchObject({
+      eventType: "WagerTransactionProcessed",
+      aggregateId: result.transactionId,
+      correlationId: result.transactionId,
+      version: 1,
+      data: {
+        transactionId: result.transactionId,
+        walletId: wallet.id,
+        kind: "LOSS",
+        status: "PROCESSED",
+        money: {
+          amount: "0.00",
+          currency: "BRL",
+        },
+        balance: {
+          amount: "100.00",
+          currency: "BRL",
+        },
+      },
     });
   });
 
